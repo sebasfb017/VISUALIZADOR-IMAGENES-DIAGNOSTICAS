@@ -1,0 +1,92 @@
+/* Premium styles for remoto1.css */
+/* Glassmorphic per-page dropdown button */
+.per-page-btn {
+    padding: 0.5rem 1rem;
+    font-size: 0.95rem;
+    border-radius: 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+    color: #0f172a;
+    background: rgba(255, 255, 255, 0.9);
+    border: 1px solid rgba(226, 232, 240, 0.8);
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+}
+
+.per-page-btn:hover {
+    background: #ffffff;
+    transform: translateY(-2px);
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+    border-color: #cbd5e1;
+}
+
+.per-page-btn + .dropdown-menu {
+    border: 1px solid rgba(226, 232, 240, 0.8);
+    border-radius: 16px;
+    box-shadow: 0 20px 40px -10px rgba(0, 0, 0, 0.15);
+    padding: 10px;
+    background: rgba(255, 255, 255, 0.95);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+}
+
+.per-page-btn + .dropdown-menu .dropdown-item {
+    border-radius: 8px;
+    padding: 10px 16px;
+    transition: all 0.2s;
+    font-weight: 500;
+    color: #475569;
+}
+
+.per-page-btn + .dropdown-menu .dropdown-item:hover {
+    background: #eff6ff;
+    color: #2563eb;
+    transform: translateX(4px);
+}
+
+/* Modality options */
+.modality-item {
+    border: none;
+    background: transparent;
+    text-align: left;
+    padding: 10px 14px;
+    border-radius: 10px;
+    width: 100%;
+    color: #334155;
+    font-size: 0.95rem;
+    font-weight: 500;
+    transition: all 0.2s ease;
+}
+
+.modality-item:hover {
+    background: #f1f5f9;
+    color: #0f172a;
+}
+
+.modality-item.selected {
+    background: #eff6ff !important;
+    color: #1d4ed8 !important;
+    border-left: 4px solid #2563eb;
+}
+
+/* Universal outline rings for accessibility and sleekness */
+.btn:focus, .form-control:focus, .per-page-btn:focus {
+    box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.15) !important;
+    outline: none;
+}
+
+/* Utilities */
+.date-presets .btn { margin-right: 8px; margin-bottom: 8px; }
+.modality-controls { display: flex; gap: 8px; margin-bottom: 12px; }
+
+/* Subtle pulse animation for loading buttons */
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+.btn.disabled {
+    animation: pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+    pointer-events: none;
+}
