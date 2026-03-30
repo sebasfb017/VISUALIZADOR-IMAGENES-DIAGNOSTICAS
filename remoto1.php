@@ -3,11 +3,13 @@ ob_start();
 session_start();
 
 /**
- * CONFIGURACIÓN BÁSICA
- * Ajusta estos valores según tu entorno
+ * ============================================================================
+ * SECCIÓN 1: CONFIGURACIÓN BÁSICA
+ * ============================================================================
+ * Ajusta estos valores según tu entorno (IP de Orthanc, credenciales, etc.)
  */
 
-// Orthanc HTTP en el mismo equipo
+// URL del servidor Orthanc
 $ORTHANC_URL = 'http://192.168.52.155:8042';
 
 // Alias de ClearCanvas en "DicomModalities" de Orthanc
@@ -36,7 +38,10 @@ $USERS['invitado'] = 'invitado';
 define('MAX_CONCURRENT_QUERIES', 5);
 
 /**
- * FUNCIONES AUXILIARES
+ * ============================================================================
+ * SECCIÓN 2: FUNCIONES AUXILIARES
+ * ============================================================================
+ * Métodos para la comunicación REST con Orthanc y formateo de datos DICOM.
  */
 
 // Llamada genérica a la API REST de Orthanc
@@ -429,7 +434,10 @@ function create_plain_zip(array $filesMap, string $zipPath): bool {
 }
 
 /**
- * ESTADO GENERAL
+ * ============================================================================
+ * SECCIÓN 3: ESTADO GENERAL Y CONSTANTES
+ * ============================================================================
+ * Variables globales para UI, mapeo de modalidades DICOM y mensajes de estado.
  */
 
 $status         = null;  // 'ok' o 'error' para mensajes de la app
@@ -457,7 +465,9 @@ $doRetrieve     = false; // inicializar
 $loginError     = '';
 
 /**
- * LOGOUT
+ * ============================================================================
+ * SECCIÓN 4: CONTROL DE ACCESO (LOGOUT)
+ * ============================================================================
  */
 if (isset($_GET['logout'])) {
     session_destroy();
@@ -466,7 +476,10 @@ if (isset($_GET['logout'])) {
 }
 
 /**
- * LOGIN
+ * ============================================================================
+ * SECCIÓN 5: CONTROL DE ACCESO (LOGIN)
+ * ============================================================================
+ * Sistema de autenticación con validación (soporta hash bcrypt o texto plano).
  */
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'login') {
     $username = trim($_POST['username'] ?? '');
@@ -497,6 +510,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'login
     }
 }
 
+/**
+ * ============================================================================
+ * SECCIÓN 6: LÓGICA DE VISUALIZACIÓN (C-MOVE CONDICIONAL)
+ * ============================================================================
+ * Si se solicita "view" de un estudio que fue encontrado remotamente,
+ * se lanza un C-MOVE hacia $ORTHANC_AET y se redirige al sistema de espera.
+ */
 if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 'view') {
     $studyUid = trim($_GET['study_uid'] ?? '');
     $queryId  = trim($_GET['query_id'] ?? '') ?: (isset($_SESSION['last_query']['id']) ? $_SESSION['last_query']['id'] : null);
@@ -589,7 +609,11 @@ if ($doRetrieve && isset($loading)) {
 }
 
 /**
- * BÚSQUEDA / LISTADO DE ESTUDIOS (solo listamos, no realizamos C-MOVE)
+ * ============================================================================
+ * SECCIÓN 7: MOTOR DE BÚSQUEDA (C-FIND) Y COMBINACIÓN DE RESULTADOS
+ * ============================================================================
+ * Realiza la búsqueda inicial en la base de datos local de Orthanc y, de ser
+ * necesario, completa la lista mediante consultas remotas hacia ClearCanvas (solo listado, no C-MOVE).
  */
 if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['patient_id'])) {
     // Agregar query a la lista activa
@@ -954,7 +978,13 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
         }
     }
 }
-// Paginación: preparar $studies para la página actual usando resultados en sesión si existen
+/**
+ * ============================================================================
+ * SECCIÓN 8: PAGINACIÓN Y ORDENAMIENTO LÓGICO
+ * ============================================================================
+ * Prepara el arreglo de estudios limitándolo a la página actual de la tabla,
+ * tras aplicar el ordenamiento por fecha o nombre usando los resultados de sesión.
+ */
 $allowedPer = [10,25,50,100];
 $perPage = isset($_GET['per_page']) && in_array((int)$_GET['per_page'], $allowedPer) ? (int)$_GET['per_page'] : 10;
 $page = max(1, intval($_GET['page'] ?? 1));
@@ -1024,7 +1054,12 @@ if (isset($_SESSION['download_error'])) {
     $message = $_SESSION['download_error'];
     unset($_SESSION['download_error']);
 }
-// Nuevo flujo de descarga: inicio + espera (polling) + descarga real
+/**
+ * ============================================================================
+ * SECCIÓN 9: GESTIÓN DE DESCARGAS (INICIO DEL FLUJO)
+ * ============================================================================
+ * Preparación de empaquetado; incluye inicio, espera (polling) y descarga real.
+ */
 if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION['user'])) {
     $studyUid = trim($_GET['study_uid'] ?? '');
     if ($studyUid === '') {
@@ -1495,7 +1530,13 @@ if (isset($_GET['action']) && $_GET['action'] === 'wait_download' && isset($_SES
     exit;
 }
 
-// Endpoint ligero para que la página de espera consulte el estado
+/**
+ * ============================================================================
+ * SECCIÓN 10: ENDPOINT AJAX DE MONITOREO (CHECK_DOWNLOAD)
+ * ============================================================================
+ * Método de polling ligero que la página de espera (wait.php) consulta. Verifica 
+ * el progreso del C-MOVE para evitar caídas de timeout.
+ */
 if (isset($_GET['action']) && $_GET['action'] === 'check_download' && isset($_SESSION['user'])) {
     header('Content-Type: application/json');
     $studyUid = trim($_GET['study_uid'] ?? '');
@@ -1694,9 +1735,15 @@ $downloadSupportMessage = '';
 if (!$hasGD) $downloadSupportMessage .= 'Extensión GD no disponible.';
 if (!$hasZipArchive) { if ($downloadSupportMessage !== '') $downloadSupportMessage .= ' '; $downloadSupportMessage .= 'ZipArchive no disponible.'; }
 if (!$tmpWritable) { if ($downloadSupportMessage !== '') $downloadSupportMessage .= ' '; $downloadSupportMessage .= 'Directorio temporal no escribible: ' . $tmpDir . '.'; }
-// Consider download possible if temp dir is writable (we have fallbacks even without GD/ZipArchive)
+// Se considera posible la descarga si el directorio temporal tiene permisos de escritura
 $downloadSupported = $tmpWritable;
 
+/**
+ * ============================================================================
+ * SECCIÓN 11: INTERFAZ GRÁFICA FRONT-END
+ * ============================================================================
+ * Renderizado de la UI en HTML5 con diseño Glassmorphism y temas (Dark Mode).
+ */
 ?>
 <!DOCTYPE html>
 <html lang="es">
@@ -2636,6 +2683,13 @@ $downloadSupported = $tmpWritable;
 
 
 
+<!--
+  =============================================================================
+  SECCIÓN 12: MANEJADORES DE INTERACCIÓN CLIENTE Y AJAX (JAVASCRIPT)
+  =============================================================================
+  Scripting del lado del cliente para abrir el visualizador OHIF, gestionar
+  eventos de la interfaz y manejar alternativas de descarga.
+-->
 <script>
 (function () {
     var base = '<?php echo rtrim($OHIF_BASE_URL, "/"); ?>';

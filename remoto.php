@@ -3,8 +3,13 @@ ob_start();
 session_start();
 
 /**
- * CONFIGURACIÓN BÁSICA
- * Ajusta estos valores según tu entorno
+ * ============================================================================
+ * SECCIÓN 1: CONFIGURACIÓN BÁSICA DEL SISTEMA
+ * ============================================================================
+ * Ajusta estos valores según tu entorno.
+ * Aquí se definen las credenciales, URLs de conexión a Orthanc (el servidor 
+ * DICOM principal) y alias de Modalidades en ClearCanvas para permitir 
+ * la consulta remota y transferencia de estudios PACS.
  */
 
 // Orthanc HTTP en el mismo equipo
@@ -36,10 +41,16 @@ $USERS['invitado'] = 'invitado';
 define('MAX_CONCURRENT_QUERIES', 5);
 
 /**
- * FUNCIONES AUXILIARES
+ * ============================================================================
+ * SECCIÓN 2: FUNCIONES AUXILIARES Y DE CONEXIÓN REST
+ * ============================================================================
+ * Este bloque contiene todas las funciones auxiliares (helpers) utilizadas para 
+ * comunicarse con la API REST de Orthanc, realizar consultas C-FIND, parsear 
+ * y dar formato a la información DICOM (fechas, horas, modalidades), y procesar 
+ * estructuras complejas DICOM JSON hacia un formato plano usado por la interfaz.
  */
 
-// Llamada genérica a la API REST de Orthanc
+// Llamada genérica a la API REST de Orthanc (método central para toda comunicación)
 function callOrthanc($method, $path, $body = null)
 {
     global $ORTHANC_URL;
@@ -384,7 +395,13 @@ function getInferredModality(string $desc): string
 }
 
 /**
- * ESTADO GENERAL
+ * ============================================================================
+ * SECCIÓN 3: MANEJO DE ESTADO GLOBAL Y VARIABLES
+ * ============================================================================
+ * Se inicializan las variables que controlarán el flujo de la interfaz de
+ * usuario, incluyendo mensajes de error, lista de estudios encontrados,
+ * filtros seleccionados en la URL, e inicialización de banderas críticas 
+ * para acciones como "forzar búsqueda remota" o "iniciar recuperación (retrieve)".
  */
 
 $status = null; // 'ok' o 'error' para mensajes de la app
@@ -412,7 +429,12 @@ $doRetrieve = false; // inicializar
 $loginError = '';
 
 /**
- * LOGOUT
+ * ============================================================================
+ * SECCIÓN 4: CONTROL DE ACCESO (LOGIN / LOGOUT)
+ * ============================================================================
+ * Maneja el inicio y cierre de sesión de los usuarios. 
+ * Es importante tener esta barrera de seguridad porque se están consultando 
+ * datos médicos sensibles y de pacientes.
  */
 if (isset($_GET['logout'])) {
     session_destroy();
@@ -452,6 +474,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'login
     }
 }
 
+/**
+ * ============================================================================
+ * SECCIÓN 5: LÓGICA DE VISUALIZACIÓN OHIF (ACCIONES 'VIEW')
+ * ============================================================================
+ * Cuando el usuario hace clic en "Visualizar", este bloque revisa si el
+ * estudio ya es local. Si no (por ejemplo si viene de los resultados de
+ * ClearCanvas), recrea la consulta (C-FIND) en Canvas y lanza automáticamente 
+ * la orden de traerlo al equipo local (C-MOVE/retrieve) para luego mandarlo a 
+ * ver nativamente en el visor OHIF de Orthanc.
+ */
 if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 'view') {
     $studyUid = trim($_GET['study_uid'] ?? '');
     $queryId = trim($_GET['query_id'] ?? '') ?: (isset($_SESSION['last_query']['id']) ? $_SESSION['last_query']['id'] : null);
@@ -512,6 +544,15 @@ if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 'v
     }
 }
 
+/**
+ * ============================================================================
+ * SECCIÓN 6: DISPARO DE RETRIEVE PARA VISUALIZADOR
+ * ============================================================================
+ * Inicia la petición real al servidor remoto (ClearCanvas) para descargar el
+ * estudio hacia el nodo local de Orthanc. Una vez iniciada, redirige al 
+ * usuario a una página de espera ("wait.php" o asíncrona) para no bloquear su 
+ * navegador mientras se ejecuta el trabajo en el fondo del servidor.
+ */
 if ($doRetrieve && isset($loading)) {
     try {
         // Hacer retrieve y redirigir a página de espera en lugar de bloquear
@@ -541,7 +582,14 @@ if ($doRetrieve && isset($loading)) {
 }
 
 /**
- * BÚSQUEDA / LISTADO DE ESTUDIOS (solo listamos, no realizamos C-MOVE)
+ * ============================================================================
+ * SECCIÓN 7: MOTOR DE BÚSQUEDA PRINCIPAL (LISTADO DE ESTUDIOS)
+ * ============================================================================
+ * Ésta es la función central de la pantalla principal. Su propósito es:
+ * 1. Buscar en la base local (Orthanc) los estudios del paciente o las fechas.
+ * 2. Solicitar una búsqueda (C-FIND) al servidor remoto (ClearCanvas) con los mismos datos.
+ * 3. Combinar, normalizar y mostrar ambos conjuntos de datos, priorizando que 
+ *    los remotos se entiendan como "por importar".
  */
 if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['patient_id'])) {
     // Agregar query a la lista activa
@@ -818,7 +866,7 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
                                 if ($remoteUid && !isset($localStudyUids[$remoteUid]) && !isset($remoteStudyUids[$remoteUid])) {
                                     $remoteStudyUids[$remoteUid] = true;
                                     if (empty($norm['ModalitiesInStudy'])) {
-                                        // try to get from series
+                                        // Intentar obtener las modalidades desde las series DICOM si no se reportan a nivel de estudio
                                         $seriesQueryBody = [
                                             'Level' => 'Series',
                                             'Query' => ['0020,000D' => $remoteUid]
@@ -837,7 +885,7 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
                                             if (!empty($modalities)) {
                                                 $norm['ModalitiesInStudy'] = $modalities;
                                             }
-                                            // try to get StudyTime from first series if missing
+                                            // Intentar obtener la hora del estudio (StudyTime) extraída desde la primera serie si no viene
                                             if (empty($norm['StudyTime']) && !empty($seriesAnswers)) {
                                                 $firstSeries = reset($seriesAnswers);
                                                 $scontent = callOrthanc('GET', "/queries/" . $seriesQuery['ID'] . "/answers/" . $firstSeries . "/content?simplify");
@@ -938,6 +986,14 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
         }
     }
 }
+/**
+ * ============================================================================
+ * SECCIÓN 8: ORDENAMIENTO Y PAGINACIÓN DE ESTUDIOS
+ * ============================================================================
+ * Toma todo el array resultante (combinado entre locales y remotos almacenado 
+ * en la sesión) y realiza el orden (ascendente/descendente según fechas o nombres).
+ * Luego divide con array_slice la porción que corresponde a la página actual.
+ */
 // Paginación: preparar $studies para la página actual usando resultados en sesión si existen
 $allowedPer = [10, 25, 50, 100];
 $perPage = isset($_GET['per_page']) && in_array((int) $_GET['per_page'], $allowedPer) ? (int) $_GET['per_page'] : 10;
@@ -1006,6 +1062,17 @@ if (isset($_SESSION['last_search_results']) && is_array($_SESSION['last_search_r
     $studies = array_slice($allResults, $start, $perPage);
 }
 
+/**
+ * ============================================================================
+ * SECCIÓN 9: MÓDULO AL VUELO - DESCARGA DE IMÁGENES ZIP (.JPG)
+ * ============================================================================
+ * Gestor avanzado de creación de un ZIP bajo demanda con las imágenes del 
+ * estudio. Recorre las series e instancias del estudio en el PACS, solicita su 
+ * render ("preview") a Orthanc, convierde la imagen a JPG a través de PHP GD,
+ * los reúne en un archivo ZipArchive temporal, y lo despacha como descarga. 
+ * Además si el archivo original no existe en Orthanc, gatilla el modo C-MOVE 
+ * desde el servidor remoto primero antes de armar el ZIP final.
+ */
 // Mostrar mensaje de error de descarga (si existe)
 if (isset($_SESSION['download_error'])) {
     $status = 'error';
@@ -1428,6 +1495,15 @@ if (isset($_GET['action']) && $_GET['action'] === 'wait_download' && isset($_SES
     exit;
 }
 
+/**
+ * ============================================================================
+ * SECCIÓN 10: ENDPOINT AJAX DE MONITOREO DEL "RETRIEVE" (POLLING)
+ * ============================================================================
+ * Este pequeño servicio es consultado cada par de segundos por las pantallas de 
+ * de "Espera/Cargando". Analiza el estado en que se ubica el proceso asíncrono
+ * (Job) de transferencia DICOM en Orthanc y comunica si falló temporalmente, 
+ * o si ya está listo para mostrar visualmente / descargar imágenes.
+ */
 // Endpoint ligero para que la página de espera consulte el estado
 if (isset($_GET['action']) && $_GET['action'] === 'check_download' && isset($_SESSION['user'])) {
     header('Content-Type: application/json');
@@ -1444,7 +1520,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_download' && isset($_SE
         exit;
     }
 
-    // If we recently called retrieve and have a response, inspect it
+    // Si recientemente disparamos un C-MOVE (retrieve) y tenemos una respuesta registrada, inspeccionar el estado actual
     $lastRetrieve = $_SESSION['last_retrieve_resp'] ?? null;
     if (is_array($lastRetrieve)) {
         $gotInstances = false;
@@ -1470,7 +1546,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_download' && isset($_SE
             echo json_encode(['status' => 'failed', 'message' => 'El retrieve devolvió error DIMSE. Revisa configuración de modalidades/AETs.']);
             exit;
         }
-        // If no instances and no error, continue with normal polling/retries but inform user
+        // Si no hay instancias descargadas aún pero tampoco hay errores, se continúa con el polling periódico notificando al usuario
         debug_log('check_download: last_retrieve_resp present but no instances for study=' . $studyUid . ' resp=' . json_encode($lastRetrieve));
     }
 
@@ -1642,13 +1718,22 @@ if (!$tmpWritable) {
         $downloadSupportMessage .= ' ';
     $downloadSupportMessage .= 'Directorio temporal no escribible: ' . $tmpDir . '.';
 }
-// Consider download possible if temp dir is writable (we have fallbacks even without GD/ZipArchive)
+// Considerar que la descarga es factible siempre que exista acceso de escritura a memoria/carpeta temporal 
+// (se intentará usar sistemas integrados si GD o ZipArchive no están pre-compilados en PHP)
 $downloadSupported = $tmpWritable;
 
 if (isset($_GET['ajax'])) {
     ob_start();
 }
 ?>
+<!-- 
+===============================================================================
+SECCIÓN 11: INTERFAZ GRÁFICA FRONT-END (HTML, CSS Y VISTAS)
+===============================================================================
+A partir de aquí, el archivo PHP implementa toda la interfaz de usuario, 
+diseño y experiencia (UX). Usa la directiva "Glassmorphism", soporte para
+temas claros/oscuros (Dark Mode) y grillas responsivas.
+-->
 <!DOCTYPE html>
 <html lang="es">
 
@@ -2209,7 +2294,7 @@ if (isset($_GET['ajax'])) {
             }
         }
 
-        /* --- Premium Features CSS --- */
+        /* --- Estilos CSS Adicionales para Características Premium (Temas, Modo Oscuro, Layouts) --- */
         [data-theme="dark"] {
             --bg-color: #0f172a;
             --card-bg: rgba(30, 41, 59, 1);
@@ -2355,7 +2440,7 @@ if (isset($_GET['ajax'])) {
             color: #f9a8d4 !important;
         }
 
-        /* Fixes for forms and tables in dark mode */
+        /* Ajustes visuales de compatibilidad de inputs y layouts para el Modo Oscuro */
         [data-theme="dark"] .card {
             background: var(--card-bg);
             color: var(--text-main);
@@ -2793,7 +2878,7 @@ if (isset($_GET['ajax'])) {
                                                     $mods = implode(',', $mappedMods);
 
                                                     if (!$mods && $studyUid) {
-                                                        // fetch modalities from Orthanc
+                                                        // Tratar de recuperar las modalidades preguntando directamente a Orthanc por el nivel "Serie"
                                                         try {
                                                             $series = callOrthanc('GET', '/studies/' . urlencode($studyUid) . '/series');
                                                             if (is_array($series)) {
@@ -2815,7 +2900,7 @@ if (isset($_GET['ajax'])) {
                                                                 }
                                                             }
                                                         } catch (Exception $e) {
-                                                            // ignore if study not found
+                                                            // Ignorar el error si el estudio fue borrado o no responde
                                                         }
                                                     }
 
@@ -3093,6 +3178,16 @@ if (isset($_GET['ajax'])) {
     </div>
 
     <script>
+        /**
+         * ====================================================================
+         * SECCIÓN 12: MANEJADORES DE INTERACCIÓN CLIENTE (JAVASCRIPT)
+         * ====================================================================
+         * Códigos Javascript del lado del navegador del usuario para:
+         * 1. Manejo dinámico del tema Claro y Oscuro guardando en LocalStorage.
+         * 2. Evitar que la página se resfresque completamente mediante uso de fetch() 
+         *    para mandar la tabla de datos y botones de forma ininterrumpida (AJAX).
+         */
+
         // Theme Toggle Logic
         const themeBtn = document.getElementById('theme-toggle');
         const currentTheme = localStorage.getItem('theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
