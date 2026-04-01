@@ -65,9 +65,15 @@ function callOrthanc($method, $path, $body = null)
     $headers = ['Accept: application/json'];
 
     if ($body !== null) {
-        $payload = json_encode($body);
+        // --- [MODIFICACIÓN] Soporte para strings puros en REST API ---
+        if (is_string($body)) {
+            $payload = $body;
+            $headers[] = 'Content-Type: text/plain';
+        } else {
+            $payload = json_encode($body);
+            $headers[] = 'Content-Type: application/json';
+        }
         curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
-        $headers[] = 'Content-Type: application/json';
         $headers[] = 'Content-Length: ' . strlen($payload);
     }
 
@@ -98,7 +104,14 @@ function callOrthanc($method, $path, $body = null)
         return null;
     }
 
-    return json_decode($response, true);
+    $decoded = json_decode($response, true);
+    // --- [MODIFICACIÓN] 3. Control estricto de Errores JSON ---
+    // Detecta si la conexión con Orthanc retornó un error de Gateway (ej. 502 Bad Gateway puro HTML)
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        // En vez de inyectar el bad payload al usuario (XSS / Technical dump), se lanza excepción
+        throw new Exception("Servidor PACS devolvió un contenido irreconocible (no JSON). Es probable que Orthanc esté temporalmente detenido.");
+    }
+    return $decoded;
 }
 
 // Construye el rango de fechas DICOM a partir de YYYY-MM-DD
@@ -428,6 +441,24 @@ $doRetrieve = false; // inicializar
 // Mensaje de error de login (evita warnings si no se ha intentado iniciar sesión)
 $loginError = '';
 
+// --- [MODIFICACIÓN] 1. Control de Session Timeout y Fuerza Bruta ---
+define('SESSION_TIMEOUT_SECONDS', 3600); // 60 minutos de inactividad máxima
+define('MAX_LOGIN_ATTEMPTS', 3); // Intentos máximos de inicio de sesión
+define('LOGIN_LOCKOUT_SECONDS', 300); // 5 minutos de bloqueo
+
+if (isset($_SESSION['user'])) {
+    if (isset($_SESSION['last_activity']) && (time() - $_SESSION['last_activity'] > SESSION_TIMEOUT_SECONDS)) {
+        // La sesión ha expirado por inactividad
+        session_unset();
+        session_destroy();
+        session_start();
+        $loginError = 'Tu sesión médica ha expirado por inactividad prolongada. Por favor, inicia sesión nuevamente.';
+    } else {
+        // Renovar tiempo de vida de la sesión
+        $_SESSION['last_activity'] = time();
+    }
+}
+
 /**
  * ============================================================================
  * SECCIÓN 4: CONTROL DE ACCESO (LOGIN / LOGOUT)
@@ -446,30 +477,51 @@ if (isset($_GET['logout'])) {
  * LOGIN
  */
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'login') {
-    $username = trim($_POST['username'] ?? '');
-    $password = (string) ($_POST['password'] ?? '');
-
-    if ($username === '' || $password === '') {
-        $loginError = 'Debes ingresar usuario y contraseña.';
-    } elseif (!isset($USERS[$username])) {
-        $loginError = 'Usuario o contraseña incorrectos.';
+    // --- [MODIFICACIÓN] Control de Fuerza Bruta mediante validación de IP ---
+    $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+    if (!isset($_SESSION['login_attempts'])) {
+        $_SESSION['login_attempts'] = [];
+    }
+    
+    // Limpiar bloqueo tras expirar el tiempo de castigo (5 minutos)
+    if (isset($_SESSION['login_attempts'][$ip]) && (time() - $_SESSION['login_attempts'][$ip]['last_time'] > LOGIN_LOCKOUT_SECONDS)) {
+        unset($_SESSION['login_attempts'][$ip]);
+    }
+    
+    if (isset($_SESSION['login_attempts'][$ip]) && $_SESSION['login_attempts'][$ip]['count'] >= MAX_LOGIN_ATTEMPTS) {
+        $loginError = 'Exceso de intentos. Tu acceso ha sido bloqueado temporalmente por seguridad. Intenta en 5 minutos.';
     } else {
-        $stored = $USERS[$username];
-        $ok = false;
-        if (is_string($stored) && (strpos($stored, '$2y$') === 0 || strpos($stored, '$2b$') === 0 || strpos($stored, '$2a$') === 0)) {
-            // valor hashed con bcrypt
-            $ok = password_verify($password, $stored);
-        } else {
-            // valor en texto plano (compatibilidad)
-            $ok = ($password === $stored);
-        }
+        $username = trim($_POST['username'] ?? '');
+        $password = (string) ($_POST['password'] ?? '');
 
-        if (!$ok) {
+        if ($username === '' || $password === '') {
+            $loginError = 'Debes ingresar usuario y contraseña.';
+        } elseif (!isset($USERS[$username])) {
             $loginError = 'Usuario o contraseña incorrectos.';
+            $_SESSION['login_attempts'][$ip]['count'] = ($_SESSION['login_attempts'][$ip]['count'] ?? 0) + 1;
+            $_SESSION['login_attempts'][$ip]['last_time'] = time();
         } else {
-            $_SESSION['user'] = $username;
-            header('Location: ' . $_SERVER['PHP_SELF']);
-            exit;
+            $stored = $USERS[$username];
+            $ok = false;
+            if (is_string($stored) && (strpos($stored, '$2y$') === 0 || strpos($stored, '$2b$') === 0 || strpos($stored, '$2a$') === 0)) {
+                $ok = password_verify($password, $stored);
+            } else {
+                $ok = ($password === $stored);
+            }
+
+            if (!$ok) {
+                $loginError = 'Usuario o contraseña incorrectos.';
+                $_SESSION['login_attempts'][$ip]['count'] = ($_SESSION['login_attempts'][$ip]['count'] ?? 0) + 1;
+                $_SESSION['login_attempts'][$ip]['last_time'] = time();
+            } else {
+                // --- [MODIFICACIÓN] Regenerar Session ID contra ataques de fijación y reset de penalidades ---
+                session_regenerate_id(true);
+                $_SESSION['user'] = $username;
+                $_SESSION['last_activity'] = time(); // Iniciar cronómetro de inactividad
+                unset($_SESSION['login_attempts'][$ip]);
+                header('Location: ' . $_SERVER['PHP_SELF']);
+                exit;
+            }
         }
     }
 }
@@ -486,6 +538,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'login
  */
 if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 'view') {
     $studyUid = trim($_GET['study_uid'] ?? '');
+    
+    // --- [MODIFICACIÓN] 2. Validación Estricta RegEx de DICOM OID ---
+    // Bloquea inyecciones invalidando cualquier UID que tenga caracteres ajenos a formato médico
+    if ($studyUid !== '' && !preg_match('/^[0-9.]+$/', $studyUid)) {
+        die('Error de Seguridad: StudyInstanceUID proveído contiene caracteres no permitidos.');
+    }
+    
     $queryId = trim($_GET['query_id'] ?? '') ?: (isset($_SESSION['last_query']['id']) ? $_SESSION['last_query']['id'] : null);
     $answerIdx = trim($_GET['answer_idx'] ?? '');
 
@@ -601,6 +660,15 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
     $patientIdValue = trim($_GET['patient_id'] ?? '');
     $dateFromValue = trim($_GET['date_from'] ?? '');
     $dateToValue = trim($_GET['date_to'] ?? '');
+
+    // --- [MODIFICACIÓN] 2. Sanitizado de Formato de Entrada de Fechas ---
+    // Filtra las fechas recibidas por URL para que sean un string seguro de formato 'YYYY-MM-DD'
+    if ($dateFromValue !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateFromValue)) {
+        $dateFromValue = ''; 
+    }
+    if ($dateToValue !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateToValue)) {
+        $dateToValue = '';
+    }
 
     // Requerimos al menos un criterio: PatientID o un rango de fechas
     // Removido para permitir búsqueda de todos los estudios
@@ -1082,6 +1150,14 @@ if (isset($_SESSION['download_error'])) {
 // Nuevo flujo de descarga: inicio + espera (polling) + descarga real
 if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION['user'])) {
     $studyUid = trim($_GET['study_uid'] ?? '');
+    
+    // --- [MODIFICACIÓN] 2. Validación RegEx estricta para endpoint de descarga ---
+    if ($studyUid !== '' && !preg_match('/^[0-9.]+$/', $studyUid)) {
+        $_SESSION['download_error'] = 'Error de seguridad: StudyInstanceUID contiene formato prohibido.';
+        header('Location: ' . $_SERVER['PHP_SELF']);
+        exit;
+    }
+    
     if ($studyUid === '') {
         $_SESSION['download_error'] = 'Falta StudyInstanceUID para la descarga.';
         header('Location: ' . $_SERVER['PHP_SELF']);
@@ -1142,9 +1218,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
             }
 
             try {
-                $retrieveResp = callOrthanc('POST', '/queries/' . urlencode($queryId) . '/answers/' . urlencode($answerIdx) . '/retrieve', [
-                    'TargetAet' => $ORTHANC_AET
-                ]);
+                // Llamada con string puro (text/plain) para asegurar compatibilidad con todos los Orthanc
+                $retrieveResp = callOrthanc('POST', '/queries/' . urlencode($queryId) . '/answers/' . urlencode($answerIdx) . '/retrieve', $ORTHANC_AET);
                 debug_log('download_now triggered retrieve for study=' . $studyUid . ' q=' . $queryId . ' a=' . $answerIdx . ' resp=' . json_encode($retrieveResp));
             } catch (Exception $e) {
                 debug_log('download_now retrieve failed for study=' . $studyUid . ' error=' . $e->getMessage());
@@ -1163,11 +1238,22 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
         }
 
         try {
+            // Ampliar límites de ejecución y memoria por ser una tarea muy pesada
+            set_time_limit(0);
+            ini_set('memory_limit', '1024M');
+
             // Crear carpeta temporal
             $tmpBase = sys_get_temp_dir();
+            
+            // --- [MODIFICACIÓN] 4. Validación extra de permisos de Escritorio Temporal ---
+            // Evita desencadenar la conversión de JPGs desde la memoria si no hay permisos de disco seguros
+            if (!is_writable($tmpBase)) {
+                throw new Exception('Permiso denegado: El directorio temporal de PHP (' . $tmpBase . ') se encuentra bloqueado contra escritura.');
+            }
+            
             $workDir = $tmpBase . DIRECTORY_SEPARATOR . 'remoto_dl_' . uniqid();
             if (!mkdir($workDir) && !is_dir($workDir)) {
-                throw new Exception('No se pudo crear carpeta temporal.');
+                throw new Exception('No se pudo crear carpeta temporal para empaquetar el ZIP.');
             }
 
             $fileIndex = 1;
@@ -1347,9 +1433,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
     }
 
     try {
-        $retrieveResp = callOrthanc('POST', '/queries/' . urlencode($queryId) . '/answers/' . urlencode($answerIdx) . '/retrieve', [
-            'TargetAet' => $ORTHANC_AET
-        ]);
+        // Enviar AET como string puro para maximizar compatibilidad con Orthanc REST
+        $retrieveResp = callOrthanc('POST', '/queries/' . urlencode($queryId) . '/answers/' . urlencode($answerIdx) . '/retrieve', $ORTHANC_AET);
         // Debug: registrar respuesta de retrieve
         debug_log('retrieve initiated for study=' . $studyUid . ' query=' . $queryId . ' answer=' . $answerIdx . ' resp=' . json_encode($retrieveResp));
     } catch (Exception $e) {
@@ -1597,7 +1682,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_download' && isset($_SE
         if ($foundQ !== '' && $foundA !== '') {
             try {
                 debug_log('check_download: auto-initiating retrieve for study=' . $studyUid . ' q=' . $foundQ . ' a=' . $foundA);
-                $resp = callOrthanc('POST', '/queries/' . urlencode($foundQ) . '/answers/' . urlencode($foundA) . '/retrieve', ['TargetAet' => $ORTHANC_AET]);
+                $resp = callOrthanc('POST', '/queries/' . urlencode($foundQ) . '/answers/' . urlencode($foundA) . '/retrieve', $ORTHANC_AET);
                 $newJobId = $resp['ID'] ?? null;
                 $_SESSION['download_jobs'][$studyUid] = ['jobId' => $newJobId, 'queryId' => $foundQ, 'answerIdx' => $foundA, 'started' => time(), 'retries' => 0];
                 debug_log('check_download: auto retrieve resp=' . json_encode($resp));
@@ -1661,7 +1746,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_download' && isset($_SE
             if ($retries < $maxRetries) {
                 try {
                     debug_log('check_download: re-triggering retrieve for study=' . $studyUid . ' attempt=' . ($retries + 1));
-                    $resp = callOrthanc('POST', '/queries/' . urlencode($qId) . '/answers/' . urlencode($aIdx) . '/retrieve', ['TargetAet' => $ORTHANC_AET]);
+                    $resp = callOrthanc('POST', '/queries/' . urlencode($qId) . '/answers/' . urlencode($aIdx) . '/retrieve', $ORTHANC_AET);
                     $newJobId = $resp['ID'] ?? null;
                     $_SESSION['download_jobs'][$studyUid]['retries'] = $retries + 1;
                     $_SESSION['last_retrieve_resp'] = $resp;
@@ -2788,11 +2873,13 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                 <tr>
                                                     <th><a href="?sort=date&page=1&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?>"
                                                             style="color: inherit; text-decoration: none;">Fecha<?php if ($sort === 'date')
-                                                                echo ($_SESSION['sort_order'] === 'asc' ? ' ↑' : ' ↓'); ?></a></th>
+                                                                echo ($_SESSION['sort_order'] === 'asc' ? ' ↑' : ' ↓'); ?></a>
+                                                    </th>
                                                     <th>ID Paciente</th>
                                                     <th><a href="?sort=name&page=1&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?>"
                                                             style="color: inherit; text-decoration: none;">Nombre<?php if ($sort === 'name')
-                                                                echo ($_SESSION['sort_order'] === 'asc' ? ' ↑' : ' ↓'); ?></a></th>
+                                                                echo ($_SESSION['sort_order'] === 'asc' ? ' ↑' : ' ↓'); ?></a>
+                                                    </th>
                                                     <th>Hora</th>
                                                     <th>Modalidad(es)</th>
                                                     <th>Descripción</th>
@@ -2914,13 +3001,17 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                     ?>
                                                     <tr>
                                                         <td data-label="Fecha">
-                                                            <?php echo htmlspecialchars($dateText ?: 'N/D', ENT_QUOTES); ?></td>
+                                                            <?php echo htmlspecialchars($dateText ?: 'N/D', ENT_QUOTES); ?>
+                                                        </td>
                                                         <td data-label="ID Paciente">
-                                                            <?php echo htmlspecialchars($patientId ?: 'N/D', ENT_QUOTES); ?></td>
+                                                            <?php echo htmlspecialchars($patientId ?: 'N/D', ENT_QUOTES); ?>
+                                                        </td>
                                                         <td data-label="Nombre">
-                                                            <?php echo htmlspecialchars($patientName ?: 'N/D', ENT_QUOTES); ?></td>
+                                                            <?php echo htmlspecialchars($patientName ?: 'N/D', ENT_QUOTES); ?>
+                                                        </td>
                                                         <td data-label="Hora">
-                                                            <?php echo htmlspecialchars($timeText ?: 'N/D', ENT_QUOTES); ?></td>
+                                                            <?php echo htmlspecialchars($timeText ?: 'N/D', ENT_QUOTES); ?>
+                                                        </td>
                                                         <td data-label="Modalidad(es)">
                                                             <?php if ($mods): ?>
                                                                 <div class="d-flex flex-wrap gap-1">
@@ -3106,6 +3197,15 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                             window.location = href;
                             e.preventDefault();
                         }
+                    }
+                    var overlay = document.getElementById('action-overlay');
+                    if (overlay) {
+                        overlay.innerHTML = '<div class="text-center"><div class="spinner-border text-primary" role="status" style="width:3rem;height:3rem;"></div><div class="mt-3 fw-bold text-dark fs-5">Preparando archivo ZIP...</div><div class="mt-2 text-dark">Esto tardará un par de minutos dependiendo de la cantidad de imágenes.<br>Por favor espera pacientemente.</div></div>';
+                        overlay.style.display = 'flex';
+                        setTimeout(function () { 
+                             overlay.style.display = 'none'; 
+                             overlay.innerHTML = '<div class="text-center"><div class="spinner-border text-primary" role="status" style="width:3rem;height:3rem;"></div><div class="mt-2">Procesando...</div></div>';
+                        }, 12000); // Se oculta porque la descarga no recarga la página
                     }
                 });
             });
