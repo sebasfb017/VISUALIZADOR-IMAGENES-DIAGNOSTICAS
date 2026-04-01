@@ -422,14 +422,17 @@ function getInferredModality(string $desc): string
 function create_plain_zip(array $filesMap, string $zipPath): bool
 {
     $zp = @fopen($zipPath, 'wb');
-    if ($zp === false) return false;
+    if ($zp === false)
+        return false;
     $offset = 0;
     $central = '';
     $entries = 0;
     foreach ($filesMap as $filePath => $localName) {
-        if (!is_file($filePath)) continue;
+        if (!is_file($filePath))
+            continue;
         $data = @file_get_contents($filePath);
-        if ($data === false) continue;
+        if ($data === false)
+            continue;
         $crc = crc32($data);
         $filesize = strlen($data);
 
@@ -569,12 +572,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'login
     if (!isset($_SESSION['login_attempts'])) {
         $_SESSION['login_attempts'] = [];
     }
-    
+
     // Limpiar bloqueo tras expirar el tiempo de castigo (5 minutos)
     if (isset($_SESSION['login_attempts'][$ip]) && (time() - $_SESSION['login_attempts'][$ip]['last_time'] > LOGIN_LOCKOUT_SECONDS)) {
         unset($_SESSION['login_attempts'][$ip]);
     }
-    
+
     if (isset($_SESSION['login_attempts'][$ip]) && $_SESSION['login_attempts'][$ip]['count'] >= MAX_LOGIN_ATTEMPTS) {
         $loginError = 'Exceso de intentos. Tu acceso ha sido bloqueado temporalmente por seguridad. Intenta en 5 minutos.';
     } else {
@@ -625,13 +628,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'login
  */
 if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 'view') {
     $studyUid = trim($_GET['study_uid'] ?? '');
-    
+
     // --- [MODIFICACIÓN] 2. Validación Estricta RegEx de DICOM OID ---
     // Bloquea inyecciones invalidando cualquier UID que tenga caracteres ajenos a formato médico
     if ($studyUid !== '' && !preg_match('/^[0-9.]+$/', $studyUid)) {
         die('Error de Seguridad: StudyInstanceUID proveído contiene caracteres no permitidos.');
     }
-    
+
     $queryId = trim($_GET['query_id'] ?? '') ?: (isset($_SESSION['last_query']['id']) ? $_SESSION['last_query']['id'] : null);
     $answerIdx = trim($_GET['answer_idx'] ?? '');
 
@@ -751,7 +754,7 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
     // --- [MODIFICACIÓN] 2. Sanitizado de Formato de Entrada de Fechas ---
     // Filtra las fechas recibidas por URL para que sean un string seguro de formato 'YYYY-MM-DD'
     if ($dateFromValue !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateFromValue)) {
-        $dateFromValue = ''; 
+        $dateFromValue = '';
     }
     if ($dateToValue !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateToValue)) {
         $dateToValue = '';
@@ -1237,14 +1240,14 @@ if (isset($_SESSION['download_error'])) {
 // Nuevo flujo de descarga: inicio + espera (polling) + descarga real
 if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION['user'])) {
     $studyUid = trim($_GET['study_uid'] ?? '');
-    
+
     // --- [MODIFICACIÓN] 2. Validación RegEx estricta para endpoint de descarga ---
     if ($studyUid !== '' && !preg_match('/^[0-9.]+$/', $studyUid)) {
         $_SESSION['download_error'] = 'Error de seguridad: StudyInstanceUID contiene formato prohibido.';
         header('Location: ' . $_SERVER['PHP_SELF']);
         exit;
     }
-    
+
     if ($studyUid === '') {
         $_SESSION['download_error'] = 'Falta StudyInstanceUID para la descarga.';
         header('Location: ' . $_SERVER['PHP_SELF']);
@@ -1331,13 +1334,13 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
 
             // Crear carpeta temporal
             $tmpBase = sys_get_temp_dir();
-            
+
             // --- [MODIFICACIÓN] 4. Validación extra de permisos de Escritorio Temporal ---
             // Evita desencadenar la conversión de JPGs desde la memoria si no hay permisos de disco seguros
             if (!is_writable($tmpBase)) {
                 throw new Exception('Permiso denegado: El directorio temporal de PHP (' . $tmpBase . ') se encuentra bloqueado contra escritura.');
             }
-            
+
             $workDir = $tmpBase . DIRECTORY_SEPARATOR . 'remoto_dl_' . uniqid();
             if (!mkdir($workDir) && !is_dir($workDir)) {
                 throw new Exception('No se pudo crear carpeta temporal para empaquetar el ZIP.');
@@ -1427,8 +1430,10 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
                 $filesMap = [];
                 $dh = opendir($workDir);
                 while (($f = readdir($dh)) !== false) {
-                    if ($f === '.' || $f === '..') continue;
-                    if ($f === $zipName) continue;
+                    if ($f === '.' || $f === '..')
+                        continue;
+                    if ($f === $zipName)
+                        continue;
                     $filesMap[$workDir . DIRECTORY_SEPARATOR . $f] = $f;
                 }
                 closedir($dh);
@@ -3303,25 +3308,16 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                         alert('No es posible preparar la descarga en el servidor. ' + downloadSupportMessage + '\nContacta al administrador para habilitar el directorio temporal.');
                         return;
                     }
-                    if (!hasGD || !hasZipArchive) {
-                        var warn = 'Aviso: el servidor no tiene ' + (hasGD ? '' : 'GD (convertir a JPG) ') + (hasZipArchive ? '' : 'ZipArchive (uso de fallback) ');
-                        warn = warn.trim() + '.\nSe intentará usar métodos alternativos para generar la descarga. ¿Deseas continuar?';
-                        if (!confirm(warn)) {
-                            e.preventDefault();
-                            return;
-                        }
-                        if (href) {
-                            window.location = href;
-                            e.preventDefault();
-                        }
-                    }
+                    // La alerta de extensiones ausentes (GD, ZipArchive) fue removida
+                    // dado que el nuevo algoritmo backend realiza auto-fallback a binarios y compilación
+                    // nativa ZIP de manera invisible para el usuario sin requerir confirmación.
                     var overlay = document.getElementById('action-overlay');
                     if (overlay) {
                         overlay.innerHTML = '<div class="text-center"><div class="spinner-border text-primary" role="status" style="width:3rem;height:3rem;"></div><div class="mt-3 fw-bold text-dark fs-5">Preparando archivo ZIP...</div><div class="mt-2 text-dark">Esto tardará un par de minutos dependiendo de la cantidad de imágenes.<br>Por favor espera pacientemente.</div></div>';
                         overlay.style.display = 'flex';
-                        setTimeout(function () { 
-                             overlay.style.display = 'none'; 
-                             overlay.innerHTML = '<div class="text-center"><div class="spinner-border text-primary" role="status" style="width:3rem;height:3rem;"></div><div class="mt-2">Procesando...</div></div>';
+                        setTimeout(function () {
+                            overlay.style.display = 'none';
+                            overlay.innerHTML = '<div class="text-center"><div class="spinner-border text-primary" role="status" style="width:3rem;height:3rem;"></div><div class="mt-2">Procesando...</div></div>';
                         }, 12000); // Se oculta porque la descarga no recarga la página
                     }
                 });
