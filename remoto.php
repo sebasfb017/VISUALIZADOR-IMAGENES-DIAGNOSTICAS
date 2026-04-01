@@ -198,16 +198,27 @@ function findStudiesInOrthancByPatientId(?string $patientId, int $maxTries = 1, 
     return [];
 }
 
-// Obtiene los datos completos de un estudio en Orthanc por StudyInstanceUID
+// Obtiene los datos completos de un estudio en Orthanc por su DICOM StudyInstanceUID
 function getOrthancStudyFullData(string $studyUid): ?array
 {
     try {
-        $res = callOrthanc('GET', '/studies/' . urlencode($studyUid));
-        if (is_array($res) && isset($res['MainDicomTags'])) {
-            return $res;
+        // Orthanc requiere su propio ID interno (hash), no el DICOM UID, para rutas como /studies/.
+        // Usamos /tools/lookup para encontrar el ID interno de Orthanc a partir del StudyInstanceUID.
+        $lookup = callOrthanc('POST', '/tools/lookup', $studyUid);
+        if (is_array($lookup) && count($lookup) > 0) {
+            foreach ($lookup as $match) {
+                if (($match['Type'] ?? '') === 'Study') {
+                    $orthancId = $match['ID'];
+                    $res = callOrthanc('GET', '/studies/' . urlencode($orthancId));
+                    if (is_array($res) && isset($res['MainDicomTags'])) {
+                        $res['ID'] = $orthancId; // Aseguramos que el ID de Orthanc esté disponible
+                        return $res;
+                    }
+                }
+            }
         }
     } catch (Exception $e) {
-        // estudio no existe aún
+        // estudio no existe o el PACS devolvió error de no encontrado
     }
     return null;
 }
@@ -405,6 +416,82 @@ function getInferredModality(string $desc): string
     } else {
         return 'DX'; // Default to DX if not inferred
     }
+}
+
+// Helper: crear ZIP sin depender de ZipArchive (almacena sin compresión, fallback)
+function create_plain_zip(array $filesMap, string $zipPath): bool
+{
+    $zp = @fopen($zipPath, 'wb');
+    if ($zp === false) return false;
+    $offset = 0;
+    $central = '';
+    $entries = 0;
+    foreach ($filesMap as $filePath => $localName) {
+        if (!is_file($filePath)) continue;
+        $data = @file_get_contents($filePath);
+        if ($data === false) continue;
+        $crc = crc32($data);
+        $filesize = strlen($data);
+
+        // Local file header
+        $localHeader = pack('V', 0x04034b50);
+        $localHeader .= pack('v', 20); // version needed to extract
+        $localHeader .= pack('v', 0); // general purpose bit flag
+        $localHeader .= pack('v', 0); // compression method (0 = store)
+        $localHeader .= pack('v', 0); // last mod file time
+        $localHeader .= pack('v', 0); // last mod file date
+        $localHeader .= pack('V', $crc);
+        $localHeader .= pack('V', $filesize);
+        $localHeader .= pack('V', $filesize);
+        $localHeader .= pack('v', strlen($localName));
+        $localHeader .= pack('v', 0); // extra len
+
+        fwrite($zp, $localHeader);
+        fwrite($zp, $localName);
+        fwrite($zp, $data);
+
+        // Central directory file header
+        $centralHeader = pack('V', 0x02014b50);
+        $centralHeader .= pack('v', 0); // version made by
+        $centralHeader .= pack('v', 20); // version needed
+        $centralHeader .= pack('v', 0); // flags
+        $centralHeader .= pack('v', 0); // compression
+        $centralHeader .= pack('v', 0); // mtime
+        $centralHeader .= pack('v', 0); // mdate
+        $centralHeader .= pack('V', $crc);
+        $centralHeader .= pack('V', $filesize);
+        $centralHeader .= pack('V', $filesize);
+        $centralHeader .= pack('v', strlen($localName));
+        $centralHeader .= pack('v', 0); // extra len
+        $centralHeader .= pack('v', 0); // comment len
+        $centralHeader .= pack('v', 0); // disk number start
+        $centralHeader .= pack('v', 0); // internal attrs
+        $centralHeader .= pack('V', 0); // external attrs
+        $centralHeader .= pack('V', $offset);
+        $centralHeader .= $localName;
+
+        $central .= $centralHeader;
+
+        $offset += strlen($localHeader) + strlen($localName) + $filesize;
+        $entries++;
+    }
+
+    $centralDirOffset = $offset;
+    fwrite($zp, $central);
+    $centralSize = strlen($central);
+
+    // End of central directory record
+    $eocd = pack('V', 0x06054b50);
+    $eocd .= pack('v', 0); // disk number
+    $eocd .= pack('v', 0); // disk start
+    $eocd .= pack('v', $entries); // entries this disk
+    $eocd .= pack('v', $entries); // total entries
+    $eocd .= pack('V', $centralSize);
+    $eocd .= pack('V', $centralDirOffset);
+    $eocd .= pack('v', 0); // comment len
+    fwrite($zp, $eocd);
+    fclose($zp);
+    return true;
 }
 
 /**
@@ -1258,8 +1345,15 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
 
             $fileIndex = 1;
 
+            // Convertir DICOM UID a Hash de Orthanc para consultas directas
+            $studyData = getOrthancStudyFullData($studyUid);
+            if (!$studyData || !isset($studyData['ID'])) {
+                throw new Exception('El estudio debe ser importado completamente al PACS local primero.');
+            }
+            $orthancId = $studyData['ID'];
+
             // Obtener series del estudio
-            $seriesList = callOrthanc('GET', '/studies/' . urlencode($studyUid) . '/series');
+            $seriesList = callOrthanc('GET', '/studies/' . urlencode($orthancId) . '/series');
             foreach ($seriesList as $ser) {
                 // seriesId puede venir como string o como array con 'ID'
                 $seriesId = is_string($ser) ? $ser : ($ser['ID'] ?? null);
@@ -1281,18 +1375,24 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
                         continue;
                     }
 
-                    // convertir PNG (u otro) a JPG usando GD
-                    $img = @imagecreatefromstring($png);
-                    if ($img === false) {
-                        continue;
-                    }
-
+                    // --- [MODIFICACIÓN] Soporte Fallback sin Librería GD ---
                     $fname = sprintf('%03d.jpg', $fileIndex);
                     $outPath = $workDir . DIRECTORY_SEPARATOR . $fname;
-                    // calidad 85
-                    imagejpeg($img, $outPath, 85);
-                    imagedestroy($img);
-                    $fileIndex++;
+
+                    if (function_exists('imagecreatefromstring')) {
+                        $img = @imagecreatefromstring($png);
+                        if ($img !== false) {
+                            // calidad 85
+                            imagejpeg($img, $outPath, 85);
+                            imagedestroy($img);
+                            $fileIndex++;
+                        }
+                    } else {
+                        // Si GD no existe, guardar el payload RAW JPEG que nos devolvió Orthanc en la ruta
+                        if (file_put_contents($outPath, $png) !== false) {
+                            $fileIndex++;
+                        }
+                    }
                 }
             }
 
@@ -1304,21 +1404,38 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
             // Crear ZIP
             $zipName = 'study_' . $studyUid . '.zip';
             $zipPath = $workDir . DIRECTORY_SEPARATOR . $zipName;
-            $zip = new ZipArchive();
-            if ($zip->open($zipPath, ZipArchive::CREATE) !== true) {
-                throw new Exception('No se pudo crear el archivo ZIP.');
-            }
 
-            $dh = opendir($workDir);
-            while (($f = readdir($dh)) !== false) {
-                if ($f === '.' || $f === '..')
-                    continue;
-                if ($f === $zipName)
-                    continue;
-                $zip->addFile($workDir . DIRECTORY_SEPARATOR . $f, $f);
+            // --- [MODIFICACIÓN] Implementación de Fallback para ZIP sin Extensión Nativa ---
+            if (class_exists('ZipArchive')) {
+                $zip = new ZipArchive();
+                if ($zip->open($zipPath, ZipArchive::CREATE) !== true) {
+                    throw new Exception('No se pudo crear el archivo ZIP.');
+                }
+
+                $dh = opendir($workDir);
+                while (($f = readdir($dh)) !== false) {
+                    if ($f === '.' || $f === '..')
+                        continue;
+                    if ($f === $zipName)
+                        continue;
+                    $zip->addFile($workDir . DIRECTORY_SEPARATOR . $f, $f);
+                }
+                closedir($dh);
+                $zip->close();
+            } else {
+                // Fallback si no está ZipArchive
+                $filesMap = [];
+                $dh = opendir($workDir);
+                while (($f = readdir($dh)) !== false) {
+                    if ($f === '.' || $f === '..') continue;
+                    if ($f === $zipName) continue;
+                    $filesMap[$workDir . DIRECTORY_SEPARATOR . $f] = $f;
+                }
+                closedir($dh);
+                if (!create_plain_zip($filesMap, $zipPath)) {
+                    throw new Exception('No se pudo crear el archivo ZIP usando el método alternativo nativo.');
+                }
             }
-            closedir($dh);
-            $zip->close();
 
             // Enviar ZIP al navegador
             header('Content-Type: application/zip');
