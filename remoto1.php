@@ -4,12 +4,15 @@ session_start();
 
 /**
  * ============================================================================
- * SECCIÓN 1: CONFIGURACIÓN BÁSICA
+ * SECCIÓN 1: CONFIGURACIÓN BÁSICA DEL SISTEMA
  * ============================================================================
- * Ajusta estos valores según tu entorno (IP de Orthanc, credenciales, etc.)
+ * Ajusta estos valores según tu entorno.
+ * Aquí se definen las credenciales, URLs de conexión a Orthanc (el servidor 
+ * DICOM principal) y alias de Modalidades en ClearCanvas para permitir 
+ * la consulta remota y transferencia de estudios PACS.
  */
 
-// URL del servidor Orthanc
+// Orthanc HTTP en el mismo equipo
 $ORTHANC_URL = 'http://192.168.52.155:8042';
 
 // Alias de ClearCanvas en "DicomModalities" de Orthanc
@@ -20,12 +23,12 @@ $ORTHANC_AET = 'ORTHANC';
 
 // Base de OHIF dentro de Orthanc.
 // Usando el visor OHIF: /ohif/viewer?StudyInstanceUIDs=
-$OHIF_BASE_URL    ='http://181.56.10.196:8042';
+$OHIF_BASE_URL = 'http://181.56.10.196:8042'; // IP Externa / Remota específica para Buscador 1
 $OHIF_VIEWER_PATH = '/ohif/viewer?StudyInstanceUIDs=';
 
 // Usuarios para login (cámbialos por algo más seguro)
 $USERS = [
-    'admin' => '$2y$10$1hQIP5E4AOkgxs4AfLUw9ee/mln2.jyWFy/ngF9RfqWfBhqFLQN5W',   // usuario: admin / clave: admin
+    'admin' => '$2y$10$1hQIP5E4AOkgxs4AfLUw9ee/mln2.jyWFy/ngF9RfqWfBhqFLQN5W', // usuario: admin / clave: admin
     'MEDICO' => '$2y$10$nmo/DuvhjBpoxZymJoyBAO1o8d1MCbD0CQoziKssZgU9Dr/8YtZTe',
 ];
 
@@ -39,17 +42,21 @@ define('MAX_CONCURRENT_QUERIES', 5);
 
 /**
  * ============================================================================
- * SECCIÓN 2: FUNCIONES AUXILIARES
+ * SECCIÓN 2: FUNCIONES AUXILIARES Y DE CONEXIÓN REST
  * ============================================================================
- * Métodos para la comunicación REST con Orthanc y formateo de datos DICOM.
+ * Este bloque contiene todas las funciones auxiliares (helpers) utilizadas para 
+ * comunicarse con la API REST de Orthanc, realizar consultas C-FIND, parsear 
+ * y dar formato a la información DICOM (fechas, horas, modalidades), y procesar 
+ * estructuras complejas DICOM JSON hacia un formato plano usado por la interfaz.
  */
 
-// Llamada genérica a la API REST de Orthanc
-function callOrthanc($method, $path, $body = null) {
+// Llamada genérica a la API REST de Orthanc (método central para toda comunicación)
+function callOrthanc($method, $path, $body = null)
+{
     global $ORTHANC_URL;
 
     $url = rtrim($ORTHANC_URL, '/') . $path;
-    $ch  = curl_init($url);
+    $ch = curl_init($url);
 
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
@@ -58,9 +65,15 @@ function callOrthanc($method, $path, $body = null) {
     $headers = ['Accept: application/json'];
 
     if ($body !== null) {
-        $payload = json_encode($body);
+        // --- [MODIFICACIÓN] Soporte para strings puros en REST API ---
+        if (is_string($body)) {
+            $payload = $body;
+            $headers[] = 'Content-Type: text/plain';
+        } else {
+            $payload = json_encode($body);
+            $headers[] = 'Content-Type: application/json';
+        }
         curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
-        $headers[] = 'Content-Type: application/json';
         $headers[] = 'Content-Length: ' . strlen($payload);
     }
 
@@ -91,14 +104,22 @@ function callOrthanc($method, $path, $body = null) {
         return null;
     }
 
-    return json_decode($response, true);
+    $decoded = json_decode($response, true);
+    // --- [MODIFICACIÓN] 3. Control estricto de Errores JSON ---
+    // Detecta si la conexión con Orthanc retornó un error de Gateway (ej. 502 Bad Gateway puro HTML)
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        // En vez de inyectar el bad payload al usuario (XSS / Technical dump), se lanza excepción
+        throw new Exception("Servidor PACS devolvió un contenido irreconocible (no JSON). Es probable que Orthanc esté temporalmente detenido.");
+    }
+    return $decoded;
 }
 
 // Construye el rango de fechas DICOM a partir de YYYY-MM-DD
 // DICOM: YYYYMMDD o YYYYMMDD-YYYYMMDD
-function buildDicomDateRange(?string $dateFrom, ?string $dateTo): ?string {
+function buildDicomDateRange(?string $dateFrom, ?string $dateTo): ?string
+{
     $from = null;
-    $to   = null;
+    $to = null;
 
     if (!empty($dateFrom)) {
         $from = str_replace('-', '', $dateFrom); // 2025-12-04 -> 20251204
@@ -119,8 +140,10 @@ function buildDicomDateRange(?string $dateFrom, ?string $dateTo): ?string {
 }
 
 // Formatea fecha DICOM (YYYYMMDD) a DD/MM/YYYY
-function formatDicomDate(?string $d): string {
-    if ($d === null) return '';
+function formatDicomDate(?string $d): string
+{
+    if ($d === null)
+        return '';
     $d = trim($d);
     if (strlen($d) === 8 && ctype_digit($d)) {
         return substr($d, 6, 2) . '/' . substr($d, 4, 2) . '/' . substr($d, 0, 4);
@@ -129,8 +152,10 @@ function formatDicomDate(?string $d): string {
 }
 
 // Formatea hora DICOM (HHMMSS...) a HH:MM:SS o HH:MM
-function formatDicomTime(?string $t): string {
-    if ($t === null) return '';
+function formatDicomTime(?string $t): string
+{
+    if ($t === null)
+        return '';
     $t = trim($t);
     if (strlen($t) >= 6 && ctype_digit(substr($t, 0, 6))) {
         return substr($t, 0, 2) . ':' . substr($t, 2, 2) . ':' . substr($t, 4, 2);
@@ -141,7 +166,8 @@ function formatDicomTime(?string $t): string {
 }
 
 // Buscar estudios en Orthanc a partir de un query DICOM (PatientID opcional)
-function findStudiesInOrthancByPatientId(?string $patientId, int $maxTries = 1, int $delaySeconds = 0, ?string $dateFrom = null, ?string $dateTo = null): array {
+function findStudiesInOrthancByPatientId(?string $patientId, int $maxTries = 1, int $delaySeconds = 0, ?string $dateFrom = null, ?string $dateTo = null): array
+{
     $query = [];
 
     if ($patientId !== null && $patientId !== '') {
@@ -154,9 +180,9 @@ function findStudiesInOrthancByPatientId(?string $patientId, int $maxTries = 1, 
     }
 
     $body = [
-        'Level'  => 'Study',
+        'Level' => 'Study',
         'Expand' => true,
-        'Query'  => $query,
+        'Query' => $query,
     ];
 
     for ($i = 0; $i < $maxTries; $i++) {
@@ -172,34 +198,50 @@ function findStudiesInOrthancByPatientId(?string $patientId, int $maxTries = 1, 
     return [];
 }
 
-// Obtiene los datos completos de un estudio en Orthanc por StudyInstanceUID
-function getOrthancStudyFullData(string $studyUid): ?array {
+// Obtiene los datos completos de un estudio en Orthanc por su DICOM StudyInstanceUID
+function getOrthancStudyFullData(string $studyUid): ?array
+{
     try {
-        $res = callOrthanc('GET', '/studies/' . urlencode($studyUid));
-        if (is_array($res) && isset($res['MainDicomTags'])) {
-            return $res;
+        // Orthanc requiere su propio ID interno (hash), no el DICOM UID, para rutas como /studies/.
+        // Usamos /tools/lookup para encontrar el ID interno de Orthanc a partir del StudyInstanceUID.
+        $lookup = callOrthanc('POST', '/tools/lookup', $studyUid);
+        if (is_array($lookup) && count($lookup) > 0) {
+            foreach ($lookup as $match) {
+                if (($match['Type'] ?? '') === 'Study') {
+                    $orthancId = $match['ID'];
+                    $res = callOrthanc('GET', '/studies/' . urlencode($orthancId));
+                    if (is_array($res) && isset($res['MainDicomTags'])) {
+                        $res['ID'] = $orthancId; // Aseguramos que el ID de Orthanc esté disponible
+                        return $res;
+                    }
+                }
+            }
         }
     } catch (Exception $e) {
-        // estudio no existe aún
+        // estudio no existe o el PACS devolvió error de no encontrado
     }
     return null;
 }
 
 
 // Verifica si un estudio existe en Orthanc
-function orthancStudyExists(string $studyUid): bool {
+function orthancStudyExists(string $studyUid): bool
+{
     return getOrthancStudyFullData($studyUid) !== null;
 }
 
 // Normaliza contenido simplificado de una respuesta de query a un set de MainDicomTags
-function normalizeQueryContent(array $c): array {
+function normalizeQueryContent(array $c): array
+{
     $tags = [];
     // StudyInstanceUID: buscar en varias claves (puede venir como '0020,000D' o StudyInstanceUID)
     $tags['StudyInstanceUID'] = $c['StudyInstanceUID'] ?? $c['0020,000D'] ?? null;
     // extraer StudyDate en múltiples formatos
     $sd = '';
-    if (isset($c['StudyDate'])) $sd = extractTagValue($c['StudyDate']);
-    if ($sd === '' && isset($c['0008,0020'])) $sd = extractTagValue($c['0008,0020']);
+    if (isset($c['StudyDate']))
+        $sd = extractTagValue($c['StudyDate']);
+    if ($sd === '' && isset($c['0008,0020']))
+        $sd = extractTagValue($c['0008,0020']);
     $tags['StudyDate'] = $sd ?: null;
 
     // Patient / Nombre: buscar PatientName en varias formas
@@ -240,22 +282,28 @@ function normalizeQueryContent(array $c): array {
 }
 
 // Devuelve el primer valor no vacío de una lista de claves dentro de $tags
-function pickTag(array $tags, array $keys): string {
+function pickTag(array $tags, array $keys): string
+{
     foreach ($keys as $k) {
         if (array_key_exists($k, $tags) && $tags[$k] !== null) {
             $v = $tags[$k];
             $ex = extractTagValue($v);
-            if ($ex !== '' && $ex !== '0' && $ex !== '[]') return $ex;
+            if ($ex !== '' && $ex !== '0' && $ex !== '[]')
+                return $ex;
         }
     }
     return '';
 }
 
 // Extrae un valor legible de múltiples representaciones DICOM JSON
-function extractTagValue($v): string {
-    if ($v === null) return '';
-    if (is_string($v)) return trim($v);
-    if (is_numeric($v)) return (string) $v;
+function extractTagValue($v): string
+{
+    if ($v === null)
+        return '';
+    if (is_string($v))
+        return trim($v);
+    if (is_numeric($v))
+        return (string) $v;
     if (is_array($v)) {
         // Estructura tipo Orthanc: ['Value' => [ '20260318' ], 'vr' => 'DA']
         if (isset($v['Value']) && is_array($v['Value']) && count($v['Value']) > 0) {
@@ -264,41 +312,50 @@ function extractTagValue($v): string {
                 // si es complejo intentar convertir a string
                 return trim(json_encode($first));
             }
-            return trim((string)$first);
+            return trim((string) $first);
         }
         // Estructura tipo nombre: ['Alphabetic' => 'LAST^FIRST']
-        if (isset($v['Alphabetic'])) return trim((string)$v['Alphabetic']);
+        if (isset($v['Alphabetic']))
+            return trim((string) $v['Alphabetic']);
         // Si es mapa simple con claves, intentar juntar valores
         $flat = [];
         foreach ($v as $k => $val) {
-            if (is_array($val) || is_object($val)) continue;
-            $s = trim((string)$val);
-            if ($s !== '') $flat[] = $s;
+            if (is_array($val) || is_object($val))
+                continue;
+            $s = trim((string) $val);
+            if ($s !== '')
+                $flat[] = $s;
         }
-        if (!empty($flat)) return implode(' ', $flat);
+        if (!empty($flat))
+            return implode(' ', $flat);
         // Si es array indexado, tomar primer elemento convertible
         foreach ($v as $item) {
-            if (is_string($item) || is_numeric($item)) return trim((string)$item);
-            if (is_array($item) && isset($item['Value']) && is_array($item['Value']) && count($item['Value'])>0) return trim((string)$item['Value'][0]);
+            if (is_string($item) || is_numeric($item))
+                return trim((string) $item);
+            if (is_array($item) && isset($item['Value']) && is_array($item['Value']) && count($item['Value']) > 0)
+                return trim((string) $item['Value'][0]);
         }
         return '';
     }
-    if (is_object($v)) return trim(json_encode($v));
+    if (is_object($v))
+        return trim(json_encode($v));
     return '';
 }
 
-function normalizeString($str) {
+function normalizeString($str)
+{
     $str = strtolower($str);
     $str = str_replace(['á', 'é', 'í', 'ó', 'ú', 'ñ'], ['a', 'e', 'i', 'o', 'u', 'n'], $str);
     return $str;
 }
 
 // Llamada genérica que devuelve el contenido bruto (para imágenes/previews)
-function callOrthancRaw($method, $path, $body = null) {
+function callOrthancRaw($method, $path, $body = null)
+{
     global $ORTHANC_URL;
 
     $url = rtrim($ORTHANC_URL, '/') . $path;
-    $ch  = curl_init($url);
+    $ch = curl_init($url);
 
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
@@ -312,7 +369,8 @@ function callOrthancRaw($method, $path, $body = null) {
         $headers[] = 'Content-Length: ' . strlen($payload);
     }
 
-    if (!empty($headers)) curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    if (!empty($headers))
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
 
     $response = curl_exec($ch);
     $httpCode = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -333,13 +391,15 @@ function callOrthancRaw($method, $path, $body = null) {
 }
 
 // Logging temporal para depuración (escribe en sys_get_temp_dir()/remoto_debug.log)
-function debug_log($msg) {
+function debug_log($msg)
+{
     $path = rtrim(sys_get_temp_dir(), "\/") . DIRECTORY_SEPARATOR . 'remoto_debug.log';
     $entry = date('c') . ' - ' . $msg . PHP_EOL;
     @file_put_contents($path, $entry, FILE_APPEND | LOCK_EX);
 }
 
-function getInferredModality(string $desc): string {
+function getInferredModality(string $desc): string
+{
     $descLower = normalizeString($desc);
     if (strpos($descLower, 'mr') !== false || strpos($descLower, 'rm') !== false || strpos($descLower, 'magnetic') !== false || strpos($descLower, 'resonance') !== false || strpos($descLower, 'mri') !== false) {
         return 'RM';
@@ -358,17 +418,21 @@ function getInferredModality(string $desc): string {
     }
 }
 
-// Helper: crear ZIP sin depender de ZipArchive (almacena sin compresión)
-function create_plain_zip(array $filesMap, string $zipPath): bool {
+// Helper: crear ZIP sin depender de ZipArchive (almacena sin compresión, fallback)
+function create_plain_zip(array $filesMap, string $zipPath): bool
+{
     $zp = @fopen($zipPath, 'wb');
-    if ($zp === false) return false;
+    if ($zp === false)
+        return false;
     $offset = 0;
     $central = '';
     $entries = 0;
     foreach ($filesMap as $filePath => $localName) {
-        if (!is_file($filePath)) continue;
+        if (!is_file($filePath))
+            continue;
         $data = @file_get_contents($filePath);
-        if ($data === false) continue;
+        if ($data === false)
+            continue;
         $crc = crc32($data);
         $filesize = strlen($data);
 
@@ -435,17 +499,20 @@ function create_plain_zip(array $filesMap, string $zipPath): bool {
 
 /**
  * ============================================================================
- * SECCIÓN 3: ESTADO GENERAL Y CONSTANTES
+ * SECCIÓN 3: MANEJO DE ESTADO GLOBAL Y VARIABLES
  * ============================================================================
- * Variables globales para UI, mapeo de modalidades DICOM y mensajes de estado.
+ * Se inicializan las variables que controlarán el flujo de la interfaz de
+ * usuario, incluyendo mensajes de error, lista de estudios encontrados,
+ * filtros seleccionados en la URL, e inicialización de banderas críticas 
+ * para acciones como "forzar búsqueda remota" o "iniciar recuperación (retrieve)".
  */
 
-$status         = null;  // 'ok' o 'error' para mensajes de la app
-$message        = '';
-$studies        = [];
+$status = null; // 'ok' o 'error' para mensajes de la app
+$message = '';
+$studies = [];
 $patientIdValue = '';
-$dateFromValue  = '';
-$dateToValue    = '';
+$dateFromValue = '';
+$dateToValue = '';
 $selectedModalities = $_GET['modalities'] ?? [];
 $allModalities = ['RM', 'CT', 'DX', 'US', 'MG', 'XA'];
 $modalityMap = [
@@ -458,16 +525,37 @@ $modalityMap = [
     'MG' => 'MG',
     'XA' => 'XA',
 ];
-$debugDetails   = ''; // detalle técnico del último error
-$forceRemote    = false; // inicializar
-$doRetrieve     = false; // inicializar
+$debugDetails = ''; // detalle técnico del último error
+$forceRemote = false; // inicializar
+$doRetrieve = false; // inicializar
 // Mensaje de error de login (evita warnings si no se ha intentado iniciar sesión)
-$loginError     = '';
+$loginError = '';
+
+// --- [MODIFICACIÓN] 1. Control de Session Timeout y Fuerza Bruta ---
+define('SESSION_TIMEOUT_SECONDS', 3600); // 60 minutos de inactividad máxima
+define('MAX_LOGIN_ATTEMPTS', 3); // Intentos máximos de inicio de sesión
+define('LOGIN_LOCKOUT_SECONDS', 300); // 5 minutos de bloqueo
+
+if (isset($_SESSION['user'])) {
+    if (isset($_SESSION['last_activity']) && (time() - $_SESSION['last_activity'] > SESSION_TIMEOUT_SECONDS)) {
+        // La sesión ha expirado por inactividad
+        session_unset();
+        session_destroy();
+        session_start();
+        $loginError = 'Tu sesión médica ha expirado por inactividad prolongada. Por favor, inicia sesión nuevamente.';
+    } else {
+        // Renovar tiempo de vida de la sesión
+        $_SESSION['last_activity'] = time();
+    }
+}
 
 /**
  * ============================================================================
- * SECCIÓN 4: CONTROL DE ACCESO (LOGOUT)
+ * SECCIÓN 4: CONTROL DE ACCESO (LOGIN / LOGOUT)
  * ============================================================================
+ * Maneja el inicio y cierre de sesión de los usuarios. 
+ * Es importante tener esta barrera de seguridad porque se están consultando 
+ * datos médicos sensibles y de pacientes.
  */
 if (isset($_GET['logout'])) {
     session_destroy();
@@ -476,50 +564,78 @@ if (isset($_GET['logout'])) {
 }
 
 /**
- * ============================================================================
- * SECCIÓN 5: CONTROL DE ACCESO (LOGIN)
- * ============================================================================
- * Sistema de autenticación con validación (soporta hash bcrypt o texto plano).
+ * LOGIN
  */
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'login') {
-    $username = trim($_POST['username'] ?? '');
-    $password = (string) ($_POST['password'] ?? '');
+    // --- [MODIFICACIÓN] Control de Fuerza Bruta mediante validación de IP ---
+    $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+    if (!isset($_SESSION['login_attempts'])) {
+        $_SESSION['login_attempts'] = [];
+    }
 
-    if ($username === '' || $password === '') {
-        $loginError = 'Debes ingresar usuario y contraseña.';
-    } elseif (!isset($USERS[$username])) {
-        $loginError = 'Usuario o contraseña incorrectos.';
+    // Limpiar bloqueo tras expirar el tiempo de castigo (5 minutos)
+    if (isset($_SESSION['login_attempts'][$ip]) && (time() - $_SESSION['login_attempts'][$ip]['last_time'] > LOGIN_LOCKOUT_SECONDS)) {
+        unset($_SESSION['login_attempts'][$ip]);
+    }
+
+    if (isset($_SESSION['login_attempts'][$ip]) && $_SESSION['login_attempts'][$ip]['count'] >= MAX_LOGIN_ATTEMPTS) {
+        $loginError = 'Exceso de intentos. Tu acceso ha sido bloqueado temporalmente por seguridad. Intenta en 5 minutos.';
     } else {
-        $stored = $USERS[$username];
-        $ok = false;
-        if (is_string($stored) && (strpos($stored, '$2y$') === 0 || strpos($stored, '$2b$') === 0 || strpos($stored, '$2a$') === 0)) {
-            // valor hashed con bcrypt
-            $ok = password_verify($password, $stored);
-        } else {
-            // valor en texto plano (compatibilidad)
-            $ok = ($password === $stored);
-        }
+        $username = trim($_POST['username'] ?? '');
+        $password = (string) ($_POST['password'] ?? '');
 
-        if (!$ok) {
+        if ($username === '' || $password === '') {
+            $loginError = 'Debes ingresar usuario y contraseña.';
+        } elseif (!isset($USERS[$username])) {
             $loginError = 'Usuario o contraseña incorrectos.';
+            $_SESSION['login_attempts'][$ip]['count'] = ($_SESSION['login_attempts'][$ip]['count'] ?? 0) + 1;
+            $_SESSION['login_attempts'][$ip]['last_time'] = time();
         } else {
-            $_SESSION['user'] = $username;
-            header('Location: ' . $_SERVER['PHP_SELF']);
-            exit;
+            $stored = $USERS[$username];
+            $ok = false;
+            if (is_string($stored) && (strpos($stored, '$2y$') === 0 || strpos($stored, '$2b$') === 0 || strpos($stored, '$2a$') === 0)) {
+                $ok = password_verify($password, $stored);
+            } else {
+                $ok = ($password === $stored);
+            }
+
+            if (!$ok) {
+                $loginError = 'Usuario o contraseña incorrectos.';
+                $_SESSION['login_attempts'][$ip]['count'] = ($_SESSION['login_attempts'][$ip]['count'] ?? 0) + 1;
+                $_SESSION['login_attempts'][$ip]['last_time'] = time();
+            } else {
+                // --- [MODIFICACIÓN] Regenerar Session ID contra ataques de fijación y reset de penalidades ---
+                session_regenerate_id(true);
+                $_SESSION['user'] = $username;
+                $_SESSION['last_activity'] = time(); // Iniciar cronómetro de inactividad
+                unset($_SESSION['login_attempts'][$ip]);
+                header('Location: ' . $_SERVER['PHP_SELF']);
+                exit;
+            }
         }
     }
 }
 
 /**
  * ============================================================================
- * SECCIÓN 6: LÓGICA DE VISUALIZACIÓN (C-MOVE CONDICIONAL)
+ * SECCIÓN 5: LÓGICA DE VISUALIZACIÓN OHIF (ACCIONES 'VIEW')
  * ============================================================================
- * Si se solicita "view" de un estudio que fue encontrado remotamente,
- * se lanza un C-MOVE hacia $ORTHANC_AET y se redirige al sistema de espera.
+ * Cuando el usuario hace clic en "Visualizar", este bloque revisa si el
+ * estudio ya es local. Si no (por ejemplo si viene de los resultados de
+ * ClearCanvas), recrea la consulta (C-FIND) en Canvas y lanza automáticamente 
+ * la orden de traerlo al equipo local (C-MOVE/retrieve) para luego mandarlo a 
+ * ver nativamente en el visor OHIF de Orthanc.
  */
 if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 'view') {
     $studyUid = trim($_GET['study_uid'] ?? '');
-    $queryId  = trim($_GET['query_id'] ?? '') ?: (isset($_SESSION['last_query']['id']) ? $_SESSION['last_query']['id'] : null);
+
+    // --- [MODIFICACIÓN] 2. Validación Estricta RegEx de DICOM OID ---
+    // Bloquea inyecciones invalidando cualquier UID que tenga caracteres ajenos a formato médico
+    if ($studyUid !== '' && !preg_match('/^[0-9.]+$/', $studyUid)) {
+        die('Error de Seguridad: StudyInstanceUID proveído contiene caracteres no permitidos.');
+    }
+
+    $queryId = trim($_GET['query_id'] ?? '') ?: (isset($_SESSION['last_query']['id']) ? $_SESSION['last_query']['id'] : null);
     $answerIdx = trim($_GET['answer_idx'] ?? '');
 
     if ($studyUid === '') {
@@ -570,22 +686,28 @@ if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 'v
             $waitTime = 0; // Se esperará el retrieve antes de mostrar la página
             $loading = true;
         } catch (Exception $e) {
-            $status  = 'error';
+            $status = 'error';
             $message = $e->getMessage();
             $debugDetails = $e->getMessage();
         }
     }
 }
 
+/**
+ * ============================================================================
+ * SECCIÓN 6: DISPARO DE RETRIEVE PARA VISUALIZADOR
+ * ============================================================================
+ * Inicia la petición real al servidor remoto (ClearCanvas) para descargar el
+ * estudio hacia el nodo local de Orthanc. Una vez iniciada, redirige al 
+ * usuario a una página de espera ("wait.php" o asíncrona) para no bloquear su 
+ * navegador mientras se ejecuta el trabajo en el fondo del servidor.
+ */
 if ($doRetrieve && isset($loading)) {
     try {
         // Hacer retrieve y redirigir a página de espera en lugar de bloquear
         $retrieveResp = callOrthanc('POST', "/queries/$resolvedQueryId/answers/$resolvedAnswerIdx/retrieve", [
             'TargetAet' => $ORTHANC_AET
         ]);
-        // Log and store response for debugging
-        debug_log('doRetrieve: retrieveResp=' . json_encode($retrieveResp));
-        $_SESSION['last_retrieve_resp'] = $retrieveResp;
         if (isset($retrieveResp['ID'])) {
             $jobId = $retrieveResp['ID'];
             // Guardar jobId en sesión para polling
@@ -610,10 +732,13 @@ if ($doRetrieve && isset($loading)) {
 
 /**
  * ============================================================================
- * SECCIÓN 7: MOTOR DE BÚSQUEDA (C-FIND) Y COMBINACIÓN DE RESULTADOS
+ * SECCIÓN 7: MOTOR DE BÚSQUEDA PRINCIPAL (LISTADO DE ESTUDIOS)
  * ============================================================================
- * Realiza la búsqueda inicial en la base de datos local de Orthanc y, de ser
- * necesario, completa la lista mediante consultas remotas hacia ClearCanvas (solo listado, no C-MOVE).
+ * Ésta es la función central de la pantalla principal. Su propósito es:
+ * 1. Buscar en la base local (Orthanc) los estudios del paciente o las fechas.
+ * 2. Solicitar una búsqueda (C-FIND) al servidor remoto (ClearCanvas) con los mismos datos.
+ * 3. Combinar, normalizar y mostrar ambos conjuntos de datos, priorizando que 
+ *    los remotos se entiendan como "por importar".
  */
 if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['patient_id'])) {
     // Agregar query a la lista activa
@@ -623,8 +748,17 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
     unset($_SESSION['last_query'], $_SESSION['last_search_results']);
 
     $patientIdValue = trim($_GET['patient_id'] ?? '');
-    $dateFromValue  = trim($_GET['date_from'] ?? '');
-    $dateToValue    = trim($_GET['date_to'] ?? '');
+    $dateFromValue = trim($_GET['date_from'] ?? '');
+    $dateToValue = trim($_GET['date_to'] ?? '');
+
+    // --- [MODIFICACIÓN] 2. Sanitizado de Formato de Entrada de Fechas ---
+    // Filtra las fechas recibidas por URL para que sean un string seguro de formato 'YYYY-MM-DD'
+    if ($dateFromValue !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateFromValue)) {
+        $dateFromValue = '';
+    }
+    if ($dateToValue !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateToValue)) {
+        $dateToValue = '';
+    }
 
     // Requerimos al menos un criterio: PatientID o un rango de fechas
     // Removido para permitir búsqueda de todos los estudios
@@ -632,21 +766,21 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
     //     $status  = 'error';
     //     $message = 'Debes escribir un ID de paciente o indicar un rango de fechas.';
     // } else {
-        $dateFrom = $dateFromValue !== '' ? $dateFromValue : null;
-        $dateTo   = $dateToValue   !== '' ? $dateToValue   : null;
+    $dateFrom = $dateFromValue !== '' ? $dateFromValue : null;
+    $dateTo = $dateToValue !== '' ? $dateToValue : null;
 
-        // Validar que la fecha desde no sea posterior a la fecha hasta
-        if ($dateFrom && $dateTo && $dateFrom > $dateTo) {
-            $status = 'error';
-            $message = 'La fecha "desde" no puede ser posterior a la fecha "hasta".';
-        } else {
-            try {
-                $dateRange = buildDicomDateRange($dateFrom, $dateTo);
+    // Validar que la fecha desde no sea posterior a la fecha hasta
+    if ($dateFrom && $dateTo && $dateFrom > $dateTo) {
+        $status = 'error';
+        $message = 'La fecha "desde" no puede ser posterior a la fecha "hasta".';
+    } else {
+        try {
+            $dateRange = buildDicomDateRange($dateFrom, $dateTo);
 
-                $forceRemote = true;
+            $forceRemote = true;
 
             // 1) Estudios ya existentes en Orthanc
-            $localStudies   = findStudiesInOrthancByPatientId($patientIdValue !== '' ? $patientIdValue : null, 1, 0, $dateFrom, $dateTo);
+            $localStudies = findStudiesInOrthancByPatientId($patientIdValue !== '' ? $patientIdValue : null, 1, 0, $dateFrom, $dateTo);
             // Deduplicar estudios locales por StudyInstanceUID
             $uniqueLocal = [];
             foreach ($localStudies as $st) {
@@ -704,7 +838,14 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
 
                     // Comprobación de conectividad y existencia de la modalidad en Orthanc
                     try {
-                        $modalitiesList = callOrthanc('GET', '/modalities');
+                        $cacheFile = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'orthanc_modalities.json';
+                        if (file_exists($cacheFile) && (time() - filemtime($cacheFile)) < 3600) {
+                            $modalitiesList = json_decode(file_get_contents($cacheFile), true);
+                        } else {
+                            $modalitiesList = callOrthanc('GET', '/modalities');
+                            if ($modalitiesList)
+                                file_put_contents($cacheFile, json_encode($modalitiesList));
+                        }
                         $foundModality = false;
                         if (is_array($modalitiesList)) {
                             // Caso A: array asociativo indexado por ID
@@ -714,17 +855,29 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
                                 // Caso B: lista indexada o estructura con objetos/valores
                                 foreach ($modalitiesList as $k => $v) {
                                     // clave igual a MODALITY_ID
-                                    if (strtoupper((string)$k) === strtoupper($MODALITY_ID)) { $foundModality = true; break; }
+                                    if (strtoupper((string) $k) === strtoupper($MODALITY_ID)) {
+                                        $foundModality = true;
+                                        break;
+                                    }
 
                                     // valor simple igual a MODALITY_ID
-                                    if (is_string($v) && strtoupper($v) === strtoupper($MODALITY_ID)) { $foundModality = true; break; }
+                                    if (is_string($v) && strtoupper($v) === strtoupper($MODALITY_ID)) {
+                                        $foundModality = true;
+                                        break;
+                                    }
 
                                     // valor array/obj con campo ID o Name
                                     if (is_array($v)) {
-                                        if ((isset($v['ID']) && strtoupper((string)$v['ID']) === strtoupper($MODALITY_ID)) || (isset($v['Name']) && strtoupper((string)$v['Name']) === strtoupper($MODALITY_ID))) { $foundModality = true; break; }
+                                        if ((isset($v['ID']) && strtoupper((string) $v['ID']) === strtoupper($MODALITY_ID)) || (isset($v['Name']) && strtoupper((string) $v['Name']) === strtoupper($MODALITY_ID))) {
+                                            $foundModality = true;
+                                            break;
+                                        }
                                     } elseif (is_object($v)) {
-                                        $obj = (array)$v;
-                                        if ((isset($obj['ID']) && strtoupper((string)$obj['ID']) === strtoupper($MODALITY_ID)) || (isset($obj['Name']) && strtoupper((string)$obj['Name']) === strtoupper($MODALITY_ID))) { $foundModality = true; break; }
+                                        $obj = (array) $v;
+                                        if ((isset($obj['ID']) && strtoupper((string) $obj['ID']) === strtoupper($MODALITY_ID)) || (isset($obj['Name']) && strtoupper((string) $obj['Name']) === strtoupper($MODALITY_ID))) {
+                                            $foundModality = true;
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -749,7 +902,8 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
                         }
                     } catch (Exception $e) {
                         // si ya hay debugDetails lo conservamos
-                        if (empty($debugDetails)) $debugDetails = $e->getMessage();
+                        if (empty($debugDetails))
+                            $debugDetails = $e->getMessage();
                         throw new Exception('No se pudo conectar a Orthanc/Canvas: ' . $e->getMessage());
                     }
 
@@ -790,7 +944,8 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
                                         } else {
                                             $globalPatientName = (string) $globalPatientName;
                                         }
-                                        if ($globalPatientName !== '') $globalPatientName = str_replace('^', ' ', $globalPatientName);
+                                        if ($globalPatientName !== '')
+                                            $globalPatientName = str_replace('^', ' ', $globalPatientName);
                                         $globalPatientName = preg_replace('/^PatientName\s+String\s+/i', '', $globalPatientName);
                                     }
                                 }
@@ -801,7 +956,7 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
                             // ignorar
                         }
                     }
-                    
+
                     if (!$queryId) {
                         // No se pudo crear la query, mostrar locales si hay
                         $studies = $display;
@@ -853,9 +1008,12 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
                                         if (is_array($fullAnswer)) {
                                             $fullTagsForDate = $fullAnswer['MainDicomTags'] ?? $fullAnswer;
                                             $sd = '';
-                                            if (isset($fullTagsForDate['StudyDate'])) $sd = extractTagValue($fullTagsForDate['StudyDate']);
-                                            if ($sd === '' && isset($fullTagsForDate['0008,0020'])) $sd = extractTagValue($fullTagsForDate['0008,0020']);
-                                            if ($sd !== '') $norm['StudyDate'] = $sd;
+                                            if (isset($fullTagsForDate['StudyDate']))
+                                                $sd = extractTagValue($fullTagsForDate['StudyDate']);
+                                            if ($sd === '' && isset($fullTagsForDate['0008,0020']))
+                                                $sd = extractTagValue($fullTagsForDate['0008,0020']);
+                                            if ($sd !== '')
+                                                $norm['StudyDate'] = $sd;
                                         }
                                     } catch (Exception $e) {
                                         // ignorar si falla leer contenido completo
@@ -866,7 +1024,7 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
                                 if ($remoteUid && !isset($localStudyUids[$remoteUid]) && !isset($remoteStudyUids[$remoteUid])) {
                                     $remoteStudyUids[$remoteUid] = true;
                                     if (empty($norm['ModalitiesInStudy'])) {
-                                        // try to get from series
+                                        // Intentar obtener las modalidades desde las series DICOM si no se reportan a nivel de estudio
                                         $seriesQueryBody = [
                                             'Level' => 'Series',
                                             'Query' => ['0020,000D' => $remoteUid]
@@ -878,13 +1036,14 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
                                             foreach ($seriesAnswers as $sidx) {
                                                 $scontent = callOrthanc('GET', "/queries/" . $seriesQuery['ID'] . "/answers/" . $sidx . "/content?simplify");
                                                 $smod = $scontent['Modality'] ?? '';
-                                                if ($smod) $modalities[] = $smod;
+                                                if ($smod)
+                                                    $modalities[] = $smod;
                                             }
                                             $modalities = array_unique($modalities);
                                             if (!empty($modalities)) {
                                                 $norm['ModalitiesInStudy'] = $modalities;
                                             }
-                                            // try to get StudyTime from first series if missing
+                                            // Intentar obtener la hora del estudio (StudyTime) extraída desde la primera serie si no viene
                                             if (empty($norm['StudyTime']) && !empty($seriesAnswers)) {
                                                 $firstSeries = reset($seriesAnswers);
                                                 $scontent = callOrthanc('GET', "/queries/" . $seriesQuery['ID'] . "/answers/" . $firstSeries . "/content?simplify");
@@ -914,10 +1073,17 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
 
                             // Aplicar filtro de modalidades si seleccionado
                             if (!empty($selectedModalities)) {
-                                $display = array_filter($display, function($s) use ($selectedModalities, $modalityMap) {
+                                $display = array_filter($display, function ($s) use ($selectedModalities, $modalityMap) {
                                     $mods = $s['MainDicomTags']['ModalitiesInStudy'] ?? [];
-                                    if (!is_array($mods)) $mods = [];
-                                    $mappedMods = array_map(function($m) use ($modalityMap) { return $modalityMap[trim($m)] ?? trim($m); }, $mods);
+                                    if (!is_array($mods))
+                                        $mods = [];
+                                    $mappedMods = array_map(
+                                        function ($m) use ($modalityMap) {
+                                            return $modalityMap[trim($m)] ?? trim($m);
+                                        }
+                                        ,
+                                        $mods
+                                    );
                                     // Si no hay modalidades mapeadas, inferir de la descripción
                                     if (empty($mappedMods)) {
                                         $desc = $s['MainDicomTags']['StudyDescription'] ?? '';
@@ -968,7 +1134,7 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
                 }
             }
         } catch (Exception $e) {
-            $status  = 'error';
+            $status = 'error';
             $message = $e->getMessage();
             $debugDetails = $e->getMessage();
         }
@@ -980,13 +1146,15 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
 }
 /**
  * ============================================================================
- * SECCIÓN 8: PAGINACIÓN Y ORDENAMIENTO LÓGICO
+ * SECCIÓN 8: ORDENAMIENTO Y PAGINACIÓN DE ESTUDIOS
  * ============================================================================
- * Prepara el arreglo de estudios limitándolo a la página actual de la tabla,
- * tras aplicar el ordenamiento por fecha o nombre usando los resultados de sesión.
+ * Toma todo el array resultante (combinado entre locales y remotos almacenado 
+ * en la sesión) y realiza el orden (ascendente/descendente según fechas o nombres).
+ * Luego divide con array_slice la porción que corresponde a la página actual.
  */
-$allowedPer = [10,25,50,100];
-$perPage = isset($_GET['per_page']) && in_array((int)$_GET['per_page'], $allowedPer) ? (int)$_GET['per_page'] : 10;
+// Paginación: preparar $studies para la página actual usando resultados en sesión si existen
+$allowedPer = [10, 25, 50, 100];
+$perPage = isset($_GET['per_page']) && in_array((int) $_GET['per_page'], $allowedPer) ? (int) $_GET['per_page'] : 10;
 $page = max(1, intval($_GET['page'] ?? 1));
 $sort = $_GET['sort'] ?? 'name';
 
@@ -1009,11 +1177,13 @@ if (isset($_SESSION['last_search_results']) && is_array($_SESSION['last_search_r
 
     // Ordenar los resultados primero
     if ($sort === 'date') {
-        usort($allResults, function($a, $b) use ($order) {
+        usort($allResults, function ($a, $b) use ($order) {
             $dateA = $a['MainDicomTags']['StudyDate'] ?? '';
             $dateB = $b['MainDicomTags']['StudyDate'] ?? '';
-            if ($dateA === '' && $dateB !== '') return 1; // Vacío al final
-            if ($dateB === '' && $dateA !== '') return -1;
+            if ($dateA === '' && $dateB !== '')
+                return 1; // Vacío al final
+            if ($dateB === '' && $dateA !== '')
+                return -1;
             if ($order === 'asc') {
                 return strcmp($dateA, $dateB); // Más antiguo primero
             } else {
@@ -1021,11 +1191,13 @@ if (isset($_SESSION['last_search_results']) && is_array($_SESSION['last_search_r
             }
         });
     } elseif ($sort === 'name') {
-        usort($allResults, function($a, $b) use ($order) {
+        usort($allResults, function ($a, $b) use ($order) {
             $nameA = $a['MainDicomTags']['PatientName'] ?? '';
             $nameB = $b['MainDicomTags']['PatientName'] ?? '';
-            if ($nameA === '' && $nameB !== '') return 1; // Vacío al final
-            if ($nameB === '' && $nameA !== '') return -1;
+            if ($nameA === '' && $nameB !== '')
+                return 1; // Vacío al final
+            if ($nameB === '' && $nameA !== '')
+                return -1;
             if ($order === 'asc') {
                 return strcmp($nameA, $nameB); // A-Z
             } else {
@@ -1048,20 +1220,34 @@ if (isset($_SESSION['last_search_results']) && is_array($_SESSION['last_search_r
     $studies = array_slice($allResults, $start, $perPage);
 }
 
+/**
+ * ============================================================================
+ * SECCIÓN 9: MÓDULO AL VUELO - DESCARGA DE IMÁGENES ZIP (.JPG)
+ * ============================================================================
+ * Gestor avanzado de creación de un ZIP bajo demanda con las imágenes del 
+ * estudio. Recorre las series e instancias del estudio en el PACS, solicita su 
+ * render ("preview") a Orthanc, convierde la imagen a JPG a través de PHP GD,
+ * los reúne en un archivo ZipArchive temporal, y lo despacha como descarga. 
+ * Además si el archivo original no existe en Orthanc, gatilla el modo C-MOVE 
+ * desde el servidor remoto primero antes de armar el ZIP final.
+ */
 // Mostrar mensaje de error de descarga (si existe)
 if (isset($_SESSION['download_error'])) {
     $status = 'error';
     $message = $_SESSION['download_error'];
     unset($_SESSION['download_error']);
 }
-/**
- * ============================================================================
- * SECCIÓN 9: GESTIÓN DE DESCARGAS (INICIO DEL FLUJO)
- * ============================================================================
- * Preparación de empaquetado; incluye inicio, espera (polling) y descarga real.
- */
+// Nuevo flujo de descarga: inicio + espera (polling) + descarga real
 if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION['user'])) {
     $studyUid = trim($_GET['study_uid'] ?? '');
+
+    // --- [MODIFICACIÓN] 2. Validación RegEx estricta para endpoint de descarga ---
+    if ($studyUid !== '' && !preg_match('/^[0-9.]+$/', $studyUid)) {
+        $_SESSION['download_error'] = 'Error de seguridad: StudyInstanceUID contiene formato prohibido.';
+        header('Location: ' . $_SERVER['PHP_SELF']);
+        exit;
+    }
+
     if ($studyUid === '') {
         $_SESSION['download_error'] = 'Falta StudyInstanceUID para la descarga.';
         header('Location: ' . $_SERVER['PHP_SELF']);
@@ -1083,7 +1269,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
                     if ($uid === $studyUid && isset($item['_remote'])) {
                         $queryId = $queryId ?: ($item['_remote']['queryId'] ?? $queryId);
                         $answerIdx = $answerIdx ?: ($item['_remote']['answerIdx'] ?? $answerIdx);
-                        if ($queryId !== '' && $answerIdx !== '') break;
+                        if ($queryId !== '' && $answerIdx !== '')
+                            break;
                     }
                 }
             }
@@ -1121,11 +1308,9 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
             }
 
             try {
-                $retrieveResp = callOrthanc('POST', '/queries/' . urlencode($queryId) . '/answers/' . urlencode($answerIdx) . '/retrieve', [
-                    'TargetAet' => $ORTHANC_AET
-                ]);
+                // Llamada con string puro (text/plain) para asegurar compatibilidad con todos los Orthanc
+                $retrieveResp = callOrthanc('POST', '/queries/' . urlencode($queryId) . '/answers/' . urlencode($answerIdx) . '/retrieve', $ORTHANC_AET);
                 debug_log('download_now triggered retrieve for study=' . $studyUid . ' q=' . $queryId . ' a=' . $answerIdx . ' resp=' . json_encode($retrieveResp));
-                $_SESSION['last_retrieve_resp'] = $retrieveResp;
             } catch (Exception $e) {
                 debug_log('download_now retrieve failed for study=' . $studyUid . ' error=' . $e->getMessage());
                 $_SESSION['download_error'] = 'No se pudo iniciar retrieve para traer el estudio: ' . $e->getMessage();
@@ -1134,65 +1319,56 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
             }
 
             $jobId = $retrieveResp['ID'] ?? null;
+            if (!isset($_SESSION['download_jobs']))
+                $_SESSION['download_jobs'] = [];
+            $_SESSION['download_jobs'][$studyUid] = ['jobId' => $jobId, 'queryId' => $queryId, 'answerIdx' => $answerIdx, 'started' => time(), 'retries' => 0];
 
-            // If retrieve returned a job ID, use background polling as before
-            if ($jobId) {
-                if (!isset($_SESSION['download_jobs'])) $_SESSION['download_jobs'] = [];
-                $_SESSION['download_jobs'][$studyUid] = ['jobId' => $jobId, 'queryId' => $queryId, 'answerIdx' => $answerIdx, 'started' => time(), 'retries' => 0];
-                header('Location: ' . $_SERVER['PHP_SELF'] . '?action=wait_download&study_uid=' . urlencode($studyUid));
-                exit;
-            }
-
-            // No jobId: check response details for received instances
-            $gotInstances = false;
-            if (isset($retrieveResp['Details']) && is_array($retrieveResp['Details'])) {
-                foreach ($retrieveResp['Details'] as $d) {
-                    if (!empty($d['ReceivedInstancesIds'])) { $gotInstances = true; break; }
-                }
-            }
-
-            // If instances received or study already in Orthanc, proceed to download immediately
-            if ($gotInstances || orthancStudyExists($studyUid)) {
-                debug_log('download_now: retrieve returned instances or study now in Orthanc; proceeding to download for study=' . $studyUid);
-                header('Location: ' . $_SERVER['PHP_SELF'] . '?action=download&study_uid=' . urlencode($studyUid) . '&download_now=1');
-                exit;
-            }
-
-            // Otherwise store job info (without jobId) and redirect to wait page to poll/retry
-            if (!isset($_SESSION['download_jobs'])) $_SESSION['download_jobs'] = [];
-            $_SESSION['download_jobs'][$studyUid] = ['jobId' => null, 'queryId' => $queryId, 'answerIdx' => $answerIdx, 'started' => time(), 'retries' => 0];
-            debug_log('download_now: retrieve returned no job and no instances for study=' . $studyUid . ' resp=' . json_encode($retrieveResp));
-            $_SESSION['download_error'] = 'Retrieve iniciado pero no devolvió tarea. Se esperará en background; si no llega, use "Visualizar" primero o contacte al administrador.';
             header('Location: ' . $_SERVER['PHP_SELF'] . '?action=wait_download&study_uid=' . urlencode($studyUid));
             exit;
         }
 
         try {
-            debug_log('download_now: starting download flow for study=' . $studyUid);
+            // Ampliar límites de ejecución y memoria por ser una tarea muy pesada
+            set_time_limit(0);
+            ini_set('memory_limit', '1024M');
+
             // Crear carpeta temporal
             $tmpBase = sys_get_temp_dir();
-            debug_log('download_now: sys_get_temp_dir=' . $tmpBase);
+
+            // --- [MODIFICACIÓN] 4. Validación extra de permisos de Escritorio Temporal ---
+            // Evita desencadenar la conversión de JPGs desde la memoria si no hay permisos de disco seguros
+            if (!is_writable($tmpBase)) {
+                throw new Exception('Permiso denegado: El directorio temporal de PHP (' . $tmpBase . ') se encuentra bloqueado contra escritura.');
+            }
+
             $workDir = $tmpBase . DIRECTORY_SEPARATOR . 'remoto_dl_' . uniqid();
             if (!mkdir($workDir) && !is_dir($workDir)) {
-                debug_log('download_now: failed to create workDir=' . $workDir);
-                throw new Exception('No se pudo crear carpeta temporal.');
+                throw new Exception('No se pudo crear carpeta temporal para empaquetar el ZIP.');
             }
-            debug_log('download_now: created workDir=' . $workDir);
 
             $fileIndex = 1;
 
+            // Convertir DICOM UID a Hash de Orthanc para consultas directas
+            $studyData = getOrthancStudyFullData($studyUid);
+            if (!$studyData || !isset($studyData['ID'])) {
+                throw new Exception('El estudio debe ser importado completamente al PACS local primero.');
+            }
+            $orthancId = $studyData['ID'];
+
             // Obtener series del estudio
-            $seriesList = callOrthanc('GET', '/studies/' . urlencode($studyUid) . '/series');
+            $seriesList = callOrthanc('GET', '/studies/' . urlencode($orthancId) . '/series');
             foreach ($seriesList as $ser) {
                 // seriesId puede venir como string o como array con 'ID'
                 $seriesId = is_string($ser) ? $ser : ($ser['ID'] ?? null);
-                if (!$seriesId) continue;
+                if (!$seriesId)
+                    continue;
 
                 // obtener instancias
                 $instances = callOrthanc('GET', '/series/' . urlencode($seriesId) . '/instances');
                 foreach ($instances as $inst) {
                     $instanceId = is_string($inst) ? $inst : ($inst['ID'] ?? null);
-                    if (!$instanceId) continue;
+                    if (!$instanceId)
+                        continue;
 
                     // pedir preview (imagen rasterizada) desde Orthanc
                     try {
@@ -1202,34 +1378,23 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
                         continue;
                     }
 
-                    // Guardar preview: si GD disponible convertimos a JPG, si no guardamos crudo detectando extensión
-                    $useGD = extension_loaded('gd') && function_exists('imagecreatefromstring') && function_exists('imagejpeg');
-                    if ($useGD) {
+                    // --- [MODIFICACIÓN] Soporte Fallback sin Librería GD ---
+                    $fname = sprintf('%03d.jpg', $fileIndex);
+                    $outPath = $workDir . DIRECTORY_SEPARATOR . $fname;
+
+                    if (function_exists('imagecreatefromstring')) {
                         $img = @imagecreatefromstring($png);
-                        if ($img === false) {
-                            // fallback: guardar crudo
-                            $ext = 'png';
-                            if (strlen($png) >= 3 && substr($png,0,3) === "\xFF\xD8\xFF") $ext = 'jpg';
-                            $fname = sprintf('%03d.%s', $fileIndex, $ext);
-                            $outPath = $workDir . DIRECTORY_SEPARATOR . $fname;
-                            file_put_contents($outPath, $png);
-                            $fileIndex++;
-                        } else {
-                            $fname = sprintf('%03d.jpg', $fileIndex);
-                            $outPath = $workDir . DIRECTORY_SEPARATOR . $fname;
+                        if ($img !== false) {
+                            // calidad 85
                             imagejpeg($img, $outPath, 85);
                             imagedestroy($img);
                             $fileIndex++;
                         }
                     } else {
-                        // No GD: detectar tipo básico y guardar crudo
-                        $ext = 'png';
-                        if (strlen($png) >= 3 && substr($png,0,3) === "\xFF\xD8\xFF") $ext = 'jpg';
-                        elseif (strlen($png) >= 6 && (substr($png,0,6) === 'GIF87a' || substr($png,0,6) === 'GIF89a')) $ext = 'gif';
-                        $fname = sprintf('%03d.%s', $fileIndex, $ext);
-                        $outPath = $workDir . DIRECTORY_SEPARATOR . $fname;
-                        file_put_contents($outPath, $png);
-                        $fileIndex++;
+                        // Si GD no existe, guardar el payload RAW JPEG que nos devolvió Orthanc en la ruta
+                        if (file_put_contents($outPath, $png) !== false) {
+                            $fileIndex++;
+                        }
                     }
                 }
             }
@@ -1239,59 +1404,49 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
                 throw new Exception('No se pudieron obtener imágenes para el estudio.');
             }
 
-            // Crear ZIP (ZipArchive si está, si no usamos implementacion interna)
+            // Crear ZIP
             $zipName = 'study_' . $studyUid . '.zip';
             $zipPath = $workDir . DIRECTORY_SEPARATOR . $zipName;
 
-            // recoger archivos generados
-            $dh = opendir($workDir);
-            $files = [];
-            while (($f = readdir($dh)) !== false) {
-                if ($f === '.' || $f === '..') continue;
-                if ($f === $zipName) continue;
-                $files[] = $workDir . DIRECTORY_SEPARATOR . $f;
-            }
-            closedir($dh);
-
-            if (empty($files)) {
-                debug_log('download_now: no files generated in workDir=' . $workDir);
-                throw new Exception('No se encontraron archivos generados para archivar.');
-            }
-
-            debug_log('download_now: files to archive: ' . json_encode(array_map('basename', $files)));
-
-            $useZipArchive = class_exists('ZipArchive');
-            if ($useZipArchive) {
+            // --- [MODIFICACIÓN] Implementación de Fallback para ZIP sin Extensión Nativa ---
+            if (class_exists('ZipArchive')) {
                 $zip = new ZipArchive();
                 if ($zip->open($zipPath, ZipArchive::CREATE) !== true) {
-                    debug_log('download_now: ZipArchive->open failed for path=' . $zipPath);
-                    throw new Exception('No se pudo crear el archivo ZIP (ZipArchive).');
+                    throw new Exception('No se pudo crear el archivo ZIP.');
                 }
-                foreach ($files as $f) {
-                    $zip->addFile($f, basename($f));
+
+                $dh = opendir($workDir);
+                while (($f = readdir($dh)) !== false) {
+                    if ($f === '.' || $f === '..')
+                        continue;
+                    if ($f === $zipName)
+                        continue;
+                    $zip->addFile($workDir . DIRECTORY_SEPARATOR . $f, $f);
                 }
+                closedir($dh);
                 $zip->close();
-                debug_log('download_now: zip created via ZipArchive path=' . $zipPath . ' size=' . filesize($zipPath));
             } else {
-                // usar implementación PHP simple sin compresión
-                $map = [];
-                foreach ($files as $f) $map[$f] = basename($f);
-                if (!create_plain_zip($map, $zipPath)) {
-                    debug_log('download_now: create_plain_zip failed for path=' . $zipPath);
-                    throw new Exception('No se pudo crear el ZIP por falta de ZipArchive y fallo en implementacion alternativa.');
+                // Fallback si no está ZipArchive
+                $filesMap = [];
+                $dh = opendir($workDir);
+                while (($f = readdir($dh)) !== false) {
+                    if ($f === '.' || $f === '..')
+                        continue;
+                    if ($f === $zipName)
+                        continue;
+                    $filesMap[$workDir . DIRECTORY_SEPARATOR . $f] = $f;
                 }
-                debug_log('download_now: zip created via create_plain_zip path=' . $zipPath . ' size=' . filesize($zipPath));
+                closedir($dh);
+                if (!create_plain_zip($filesMap, $zipPath)) {
+                    throw new Exception('No se pudo crear el archivo ZIP usando el método alternativo nativo.');
+                }
             }
 
             // Enviar ZIP al navegador
-            debug_log('download_now: sending zip to client path=' . $zipPath);
             header('Content-Type: application/zip');
             header('Content-Disposition: attachment; filename="' . basename($zipName) . '"');
             header('Content-Length: ' . filesize($zipPath));
-            // flush output buffers before readfile
-            while (ob_get_level()) ob_end_clean();
             readfile($zipPath);
-            debug_log('download_now: readfile completed for path=' . $zipPath);
 
             // limpiar temporal
             foreach (glob($workDir . DIRECTORY_SEPARATOR . '*') as $f) {
@@ -1326,7 +1481,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
                 if ($uid === $studyUid) {
                     $queryId = $queryId ?: ($item['_remote']['queryId'] ?? $queryId);
                     $answerIdx = $answerIdx ?: ($item['_remote']['answerIdx'] ?? $answerIdx);
-                    if ($queryId !== '' && $answerIdx !== '') break;
+                    if ($queryId !== '' && $answerIdx !== '')
+                        break;
                 }
             }
         }
@@ -1399,12 +1555,10 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
     }
 
     try {
-        $retrieveResp = callOrthanc('POST', '/queries/' . urlencode($queryId) . '/answers/' . urlencode($answerIdx) . '/retrieve', [
-            'TargetAet' => $ORTHANC_AET
-        ]);
+        // Enviar AET como string puro para maximizar compatibilidad con Orthanc REST
+        $retrieveResp = callOrthanc('POST', '/queries/' . urlencode($queryId) . '/answers/' . urlencode($answerIdx) . '/retrieve', $ORTHANC_AET);
         // Debug: registrar respuesta de retrieve
         debug_log('retrieve initiated for study=' . $studyUid . ' query=' . $queryId . ' answer=' . $answerIdx . ' resp=' . json_encode($retrieveResp));
-        $_SESSION['last_retrieve_resp'] = $retrieveResp;
     } catch (Exception $e) {
         debug_log('retrieve failed for study=' . $studyUid . ' query=' . $queryId . ' answer=' . $answerIdx . ' error=' . $e->getMessage());
         $_SESSION['download_error'] = 'No se pudo iniciar retrieve para traer el estudio: ' . $e->getMessage();
@@ -1414,7 +1568,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
 
     // Guardar info de job en sesión para polling desde la página de espera
     $jobId = $retrieveResp['ID'] ?? null;
-    if (!isset($_SESSION['download_jobs'])) $_SESSION['download_jobs'] = [];
+    if (!isset($_SESSION['download_jobs']))
+        $_SESSION['download_jobs'] = [];
     $_SESSION['download_jobs'][$studyUid] = ['jobId' => $jobId, 'queryId' => $queryId, 'answerIdx' => $answerIdx, 'started' => time(), 'retries' => 0];
 
     // Redirigir a la página de espera que hará polling (evita timeouts PHP)
@@ -1433,97 +1588,114 @@ if (isset($_GET['action']) && $_GET['action'] === 'wait_download' && isset($_SES
 
     ?>
     <!DOCTYPE html>
-    <html><head><meta charset="utf-8"><title>Esperando estudio...</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    </head><body>
-    <div class="container p-4">
-        <div class="alert alert-info">Se ha iniciado la transferencia del estudio. Esperando a que llegue a Orthanc para generar la descarga. Esto puede tardar varios segundos o minutos según el tamaño.</div>
-        <div id="status" class="mb-3">Comprobando estado...</div>
-        <div><button id="cancel" class="btn btn-secondary">Cancelar</button></div>
-        <div class="mt-2 small text-muted">Si el retrieve no trae imágenes, prueba <strong>Visualizar</strong> primero o revisa la sección de <a href="<?php echo $_SERVER['PHP_SELF']; ?>?action=show_debug">Debug</a> para ver la respuesta del servidor.</div>
-    </div>
-    <script>
-    const study = <?php echo json_encode($studyUid); ?>;
-    let stopped = false;
-    document.getElementById('cancel').addEventListener('click', ()=>{ stopped=true; window.location = '<?php echo $_SERVER['PHP_SELF']; ?>'; });
-    async function check(){
-        if (stopped) return;
-        try{
-            const r = await fetch('<?php echo $_SERVER['PHP_SELF']; ?>?action=check_download&study_uid=' + encodeURIComponent(study) + '&_=' + Date.now());
-            const j = await r.json();
-            document.getElementById('status').innerText = j.message || j.status;
-            if (j.status === 'ready'){
-                // iniciar descarga
-                window.location = '<?php echo $_SERVER['PHP_SELF']; ?>?action=download&study_uid=' + encodeURIComponent(study) + '&download_now=1';
-                return;
-            }
-            if (j.status === 'failed'){
-                alert('Error: ' + (j.message||'Fallo al traer estudio'));
-                window.location = '<?php echo $_SERVER['PHP_SELF']; ?>';
-                return;
-            }
-        }catch(e){
-            console.error(e);
-        }
-        setTimeout(check, 3000);
-    }
-    check();
-    </script>
-    </div>
-    <!-- Premium Features Addons -->
-    <div id="loading-overlay">
-        <div class="spinner-ring"></div>
-        <h3 style="color: #ffffff; font-family: 'Outfit', sans-serif;">Procesando...</h3>
-        <p style="color: rgba(255,255,255,0.8); font-family: 'Outfit', sans-serif;">Por favor espera un momento</p>
-    </div>
+    <html lang="es">
 
-    <div class="toast-container position-fixed top-0 end-0 p-4" style="z-index: 10500;">
-        <?php if (isset($status) && ($status === 'error' || $status === 'ok')): ?>
-        <div id="systemToast" class="toast align-items-center text-white bg-<?php echo $status === 'ok' ? 'success' : 'danger'; ?> border-0" role="alert" aria-live="assertive" aria-atomic="true">
-            <div class="d-flex">
-                <div class="toast-body" style="font-family: 'Outfit', sans-serif; font-size: 1.05rem;">
-                    <?php echo $status === 'ok' ? '✅' : '⚠️'; ?> <?php echo htmlspecialchars($message, ENT_QUOTES); ?>
-                </div>
-                <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Cerrar"></button>
+    <head>
+        <meta charset="utf-8">
+        <title>Descargando Estudio...</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+        <link rel="stylesheet" href="/buscador/assets/css/remoto1.css">
+        <script>
+            const currentTheme = localStorage.getItem('theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+            if (currentTheme === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+        </script>
+        <style>
+            body {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                min-height: 100vh;
+                margin: 0;
+                background-image: radial-gradient(at 0% 0%, rgba(37, 99, 235, 0.12) 0px, transparent 50%),
+                    radial-gradient(at 100% 0%, rgba(16, 185, 129, 0.08) 0px, transparent 50%),
+                    radial-gradient(at 100% 100%, rgba(37, 99, 235, 0.12) 0px, transparent 50%);
+            }
+
+            .wait-card {
+                width: 100%;
+                max-width: 500px;
+                padding: 40px;
+                text-align: center;
+                animation: slideUp 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+            }
+
+            @keyframes slideUp {
+                from {
+                    opacity: 0;
+                    transform: translateY(20px);
+                }
+
+                to {
+                    opacity: 1;
+                    transform: translateY(0);
+                }
+            }
+
+            .spinner-ring {
+                width: 60px;
+                height: 60px;
+                margin: 0 auto 20px auto;
+                border: 4px solid rgba(37, 99, 235, 0.1);
+                border-left-color: var(--primary);
+                border-radius: 50%;
+                animation: spin 1s linear infinite;
+            }
+
+            @keyframes spin {
+                100% {
+                    transform: rotate(360deg);
+                }
+            }
+        </style>
+    </head>
+
+    <body>
+        <div class="card wait-card">
+            <h3 class="mb-4 fw-bold">Preparando Descarga</h3>
+            <div class="spinner-ring" id="wait-spinner"></div>
+            <p class="mb-4 text-muted">
+                Se ha iniciado la transferencia del estudio desde el servidor principal.<br>
+                Este proceso puede tardar unos minutos dependiendo del tamaño del estudio.
+            </p>
+            <div id="status" class="alert alert-info fw-bold mb-4 shadow-sm border-0"
+                style="background: rgba(37, 99, 235, 0.1); color: var(--text-main);">Iniciando conexión...</div>
+            <div>
+                <button id="cancel" class="btn btn-outline-secondary rounded-pill px-4 fw-medium">Cancelar</button>
+            </div>
+            <div class="mt-4 small text-muted" style="opacity: 0.8">
+                Si detectas errores, vuelve atrás y prueba la opción de <strong>Visualizar</strong> primero.
             </div>
         </div>
-        <?php endif; ?>
-    </div>
-
-    <script>
-    // Theme Toggle Logic
-    const themeBtn = document.getElementById('theme-toggle');
-    const currentTheme = localStorage.getItem('theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-    if (currentTheme === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
-
-    if (themeBtn) {
-        themeBtn.addEventListener('click', () => {
-            let theme = document.documentElement.getAttribute('data-theme');
-            if (theme === 'dark') {
-                document.documentElement.removeAttribute('data-theme');
-                localStorage.setItem('theme', 'light');
-            } else {
-                document.documentElement.setAttribute('data-theme', 'dark');
-                localStorage.setItem('theme', 'dark');
+        <script>
+            const study = <?php echo json_encode($studyUid); ?>;
+            let stopped = false;
+            document.getElementById('cancel').addEventListener('click', () => { stopped = true; window.location = '<?php echo $_SERVER['PHP_SELF']; ?>'; });
+            async function check() {
+                if (stopped) return;
+                try {
+                    const r = await fetch('<?php echo $_SERVER['PHP_SELF']; ?>?action=check_download&study_uid=' + encodeURIComponent(study) + '&_=' + Date.now());
+                    const j = await r.json();
+                    document.getElementById('status').innerText = j.message || j.status;
+                    if (j.status === 'ready') {
+                        window.location = '<?php echo $_SERVER['PHP_SELF']; ?>?action=download&study_uid=' + encodeURIComponent(study) + '&download_now=1';
+                        return;
+                    }
+                    if (j.status === 'failed') {
+                        document.getElementById('wait-spinner').style.display = 'none';
+                        document.getElementById('status').className = 'alert alert-danger fw-bold mb-4 text-danger';
+                        return;
+                    }
+                } catch (e) {
+                    console.error(e);
+                }
+                setTimeout(check, 3000);
             }
-        });
-    }
+            check();
+        </script>
+    </body>
 
-    // Spinner Logic
-    function showSpinner() {
-        document.getElementById('loading-overlay').classList.add('active');
-    }
-
-    // Toast Initialization
-    document.addEventListener('DOMContentLoaded', () => {
-        const toastElList = [].slice.call(document.querySelectorAll('.toast'));
-        const toastList = toastElList.map(function(toastEl) {
-            return new bootstrap.Toast(toastEl, { delay: 5000 });
-        });
-        toastList.forEach(toast => toast.show());
-    });
-    </script>
-    </body></html>
+    </html>
     <?php
     // registrar inicio de wait page
     debug_log('entered wait_download page for study=' . $studyUid . ' session_job=' . json_encode($_SESSION['download_jobs'][$studyUid] ?? null));
@@ -1532,48 +1704,56 @@ if (isset($_GET['action']) && $_GET['action'] === 'wait_download' && isset($_SES
 
 /**
  * ============================================================================
- * SECCIÓN 10: ENDPOINT AJAX DE MONITOREO (CHECK_DOWNLOAD)
+ * SECCIÓN 10: ENDPOINT AJAX DE MONITOREO DEL "RETRIEVE" (POLLING)
  * ============================================================================
- * Método de polling ligero que la página de espera (wait.php) consulta. Verifica 
- * el progreso del C-MOVE para evitar caídas de timeout.
+ * Este pequeño servicio es consultado cada par de segundos por las pantallas de 
+ * de "Espera/Cargando". Analiza el estado en que se ubica el proceso asíncrono
+ * (Job) de transferencia DICOM en Orthanc y comunica si falló temporalmente, 
+ * o si ya está listo para mostrar visualmente / descargar imágenes.
  */
+// Endpoint ligero para que la página de espera consulte el estado
 if (isset($_GET['action']) && $_GET['action'] === 'check_download' && isset($_SESSION['user'])) {
     header('Content-Type: application/json');
     $studyUid = trim($_GET['study_uid'] ?? '');
     if ($studyUid === '') {
         debug_log('check_download called with empty studyUid');
-        echo json_encode(['status'=>'failed','message'=>'Falta StudyInstanceUID']);
+        echo json_encode(['status' => 'failed', 'message' => 'Falta StudyInstanceUID']);
         exit;
     }
 
     if (orthancStudyExists($studyUid)) {
         debug_log('check_download: study present in Orthanc: ' . $studyUid);
-        echo json_encode(['status'=>'ready','message'=>'Estudio presente en Orthanc. Preparando descarga...']);
+        echo json_encode(['status' => 'ready', 'message' => 'Estudio presente en Orthanc. Preparando descarga...']);
         exit;
     }
 
-    // If we recently called retrieve and have a response, inspect it
+    // Si recientemente disparamos un C-MOVE (retrieve) y tenemos una respuesta registrada, inspeccionar el estado actual
     $lastRetrieve = $_SESSION['last_retrieve_resp'] ?? null;
     if (is_array($lastRetrieve)) {
         $gotInstances = false;
         $hadError = false;
         if (!empty($lastRetrieve['Details']) && is_array($lastRetrieve['Details'])) {
             foreach ($lastRetrieve['Details'] as $d) {
-                if (!empty($d['ReceivedInstancesIds'])) { $gotInstances = true; break; }
-                if (isset($d['DimseErrorStatus']) && (int)$d['DimseErrorStatus'] !== 0) { $hadError = true; }
+                if (!empty($d['ReceivedInstancesIds'])) {
+                    $gotInstances = true;
+                    break;
+                }
+                if (isset($d['DimseErrorStatus']) && (int) $d['DimseErrorStatus'] !== 0) {
+                    $hadError = true;
+                }
             }
         }
         if ($gotInstances) {
             debug_log('check_download: last_retrieve_resp indicates instances received for study=' . $studyUid);
-            echo json_encode(['status'=>'ready','message'=>'Estudio transferido a Orthanc. Preparando descarga...']);
+            echo json_encode(['status' => 'ready', 'message' => 'Estudio transferido a Orthanc. Preparando descarga...']);
             exit;
         }
         if ($hadError) {
             debug_log('check_download: last_retrieve_resp indicates DIMSE error for study=' . $studyUid . ' resp=' . json_encode($lastRetrieve));
-            echo json_encode(['status'=>'failed','message'=>'El retrieve devolvió error DIMSE. Revisa configuración de modalidades/AETs.']);
+            echo json_encode(['status' => 'failed', 'message' => 'El retrieve devolvió error DIMSE. Revisa configuración de modalidades/AETs.']);
             exit;
         }
-        // If no instances and no error, continue with normal polling/retries but inform user
+        // Si no hay instancias descargadas aún pero tampoco hay errores, se continúa con el polling periódico notificando al usuario
         debug_log('check_download: last_retrieve_resp present but no instances for study=' . $studyUid . ' resp=' . json_encode($lastRetrieve));
     }
 
@@ -1624,16 +1804,16 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_download' && isset($_SE
         if ($foundQ !== '' && $foundA !== '') {
             try {
                 debug_log('check_download: auto-initiating retrieve for study=' . $studyUid . ' q=' . $foundQ . ' a=' . $foundA);
-                $resp = callOrthanc('POST', '/queries/' . urlencode($foundQ) . '/answers/' . urlencode($foundA) . '/retrieve', ['TargetAet' => $ORTHANC_AET]);
+                $resp = callOrthanc('POST', '/queries/' . urlencode($foundQ) . '/answers/' . urlencode($foundA) . '/retrieve', $ORTHANC_AET);
                 $newJobId = $resp['ID'] ?? null;
-                $_SESSION['download_jobs'][$studyUid] = ['jobId'=>$newJobId, 'queryId'=>$foundQ, 'answerIdx'=>$foundA, 'started'=>time(), 'retries'=>0];
+                $_SESSION['download_jobs'][$studyUid] = ['jobId' => $newJobId, 'queryId' => $foundQ, 'answerIdx' => $foundA, 'started' => time(), 'retries' => 0];
                 debug_log('check_download: auto retrieve resp=' . json_encode($resp));
                 $_SESSION['last_retrieve_resp'] = $resp;
-                echo json_encode(['status'=>'pending','message'=>'Retrieve iniciado automáticamente. Esperando llegada del estudio...']);
+                echo json_encode(['status' => 'pending', 'message' => 'Retrieve iniciado automáticamente. Esperando llegada del estudio...']);
                 exit;
             } catch (Exception $e) {
                 debug_log('check_download: auto retrieve failed: ' . $e->getMessage());
-                echo json_encode(['status'=>'pending','message'=>'Error iniciando retrieve automáticamente; revisa logs.']);
+                echo json_encode(['status' => 'pending', 'message' => 'Error iniciando retrieve automáticamente; revisa logs.']);
                 exit;
             }
         }
@@ -1650,19 +1830,19 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_download' && isset($_SE
                 $task = callOrthanc('GET', '/tasks/' . urlencode($jobId));
                 $status = $task['Status'] ?? $task['status'] ?? null;
                 if ($status !== null) {
-                    $s = strtolower((string)$status);
+                    $s = strtolower((string) $status);
                     if (strpos($s, 'failed') !== false || strpos($s, 'error') !== false) {
                         debug_log('check_download: job failed job=' . $jobId . ' status=' . $status);
-                        echo json_encode(['status'=>'failed','message'=>'El retrieve falló. Estado: '.$status]);
+                        echo json_encode(['status' => 'failed', 'message' => 'El retrieve falló. Estado: ' . $status]);
                         exit;
                     }
                     debug_log('check_download: job pending job=' . $jobId . ' status=' . $status);
-                    echo json_encode(['status'=>'pending','message'=>'Retrieve en progreso (job ' . $jobId . '). Estado: ' . $status]);
+                    echo json_encode(['status' => 'pending', 'message' => 'Retrieve en progreso (job ' . $jobId . '). Estado: ' . $status]);
                     exit;
                 }
             } catch (Exception $e) {
                 debug_log('check_download: error querying task ' . $jobId . ' error=' . $e->getMessage());
-                echo json_encode(['status'=>'pending','message'=>'Retrieve iniciado. Esperando llegada del estudio...']);
+                echo json_encode(['status' => 'pending', 'message' => 'Retrieve iniciado. Esperando llegada del estudio...']);
                 exit;
             }
 
@@ -1675,7 +1855,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_download' && isset($_SE
             }
             if (!class_exists('ZipArchive')) {
                 $downloadSupported = false;
-                if ($downloadSupportMessage !== '') $downloadSupportMessage .= ' ';
+                if ($downloadSupportMessage !== '')
+                    $downloadSupportMessage .= ' ';
                 $downloadSupportMessage .= 'ZipArchive no disponible.';
             }
 
@@ -1686,8 +1867,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_download' && isset($_SE
             $maxRetries = 3;
             if ($retries < $maxRetries) {
                 try {
-                    debug_log('check_download: re-triggering retrieve for study=' . $studyUid . ' attempt=' . ($retries+1));
-                    $resp = callOrthanc('POST', '/queries/' . urlencode($qId) . '/answers/' . urlencode($aIdx) . '/retrieve', ['TargetAet' => $ORTHANC_AET]);
+                    debug_log('check_download: re-triggering retrieve for study=' . $studyUid . ' attempt=' . ($retries + 1));
+                    $resp = callOrthanc('POST', '/queries/' . urlencode($qId) . '/answers/' . urlencode($aIdx) . '/retrieve', $ORTHANC_AET);
                     $newJobId = $resp['ID'] ?? null;
                     $_SESSION['download_jobs'][$studyUid]['retries'] = $retries + 1;
                     $_SESSION['last_retrieve_resp'] = $resp;
@@ -1697,23 +1878,23 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_download' && isset($_SE
                     } else {
                         debug_log('check_download: retrieve re-trigger returned no job id; resp=' . json_encode($resp));
                     }
-                    echo json_encode(['status'=>'pending','message'=>'Reintentando retrieve (' . ($_SESSION['download_jobs'][$studyUid]['retries']) . '/' . $maxRetries . ')']);
+                    echo json_encode(['status' => 'pending', 'message' => 'Reintentando retrieve (' . ($_SESSION['download_jobs'][$studyUid]['retries']) . '/' . $maxRetries . ')']);
                     exit;
                 } catch (Exception $e) {
                     $_SESSION['download_jobs'][$studyUid]['retries'] = $retries + 1;
                     debug_log('check_download: retrieve re-trigger failed error=' . $e->getMessage());
-                    echo json_encode(['status'=>'pending','message'=>'Error iniciando retrieve; reintentando... (' . ($_SESSION['download_jobs'][$studyUid]['retries']) . '/' . $maxRetries . ')']);
+                    echo json_encode(['status' => 'pending', 'message' => 'Error iniciando retrieve; reintentando... (' . ($_SESSION['download_jobs'][$studyUid]['retries']) . '/' . $maxRetries . ')']);
                     exit;
                 }
             } else {
                 debug_log('check_download: max retries reached for study=' . $studyUid);
-                echo json_encode(['status'=>'pending','message'=>'Reintentos de retrieve agotados. Intenta de nuevo más tarde o usa "Visualizar" primero.']);
+                echo json_encode(['status' => 'pending', 'message' => 'Reintentos de retrieve agotados. Intenta de nuevo más tarde o usa "Visualizar" primero.']);
                 exit;
             }
         }
     }
 
-    echo json_encode(['status'=>'pending','message'=>'Retrieve iniciado. Esperando llegada del estudio...']);
+    echo json_encode(['status' => 'pending', 'message' => 'Retrieve iniciado. Esperando llegada del estudio...']);
     exit;
 }
 
@@ -1732,21 +1913,37 @@ $hasZipArchive = class_exists('ZipArchive');
 $tmpDir = sys_get_temp_dir();
 $tmpWritable = is_dir($tmpDir) && is_writable($tmpDir);
 $downloadSupportMessage = '';
-if (!$hasGD) $downloadSupportMessage .= 'Extensión GD no disponible.';
-if (!$hasZipArchive) { if ($downloadSupportMessage !== '') $downloadSupportMessage .= ' '; $downloadSupportMessage .= 'ZipArchive no disponible.'; }
-if (!$tmpWritable) { if ($downloadSupportMessage !== '') $downloadSupportMessage .= ' '; $downloadSupportMessage .= 'Directorio temporal no escribible: ' . $tmpDir . '.'; }
-// Se considera posible la descarga si el directorio temporal tiene permisos de escritura
+if (!$hasGD)
+    $downloadSupportMessage .= 'Extensión GD no disponible.';
+if (!$hasZipArchive) {
+    if ($downloadSupportMessage !== '')
+        $downloadSupportMessage .= ' ';
+    $downloadSupportMessage .= 'ZipArchive no disponible.';
+}
+if (!$tmpWritable) {
+    if ($downloadSupportMessage !== '')
+        $downloadSupportMessage .= ' ';
+    $downloadSupportMessage .= 'Directorio temporal no escribible: ' . $tmpDir . '.';
+}
+// Considerar que la descarga es factible siempre que exista acceso de escritura a memoria/carpeta temporal 
+// (se intentará usar sistemas integrados si GD o ZipArchive no están pre-compilados en PHP)
 $downloadSupported = $tmpWritable;
 
-/**
- * ============================================================================
- * SECCIÓN 11: INTERFAZ GRÁFICA FRONT-END
- * ============================================================================
- * Renderizado de la UI en HTML5 con diseño Glassmorphism y temas (Dark Mode).
- */
+if (isset($_GET['ajax'])) {
+    ob_start();
+}
 ?>
+<!-- 
+===============================================================================
+SECCIÓN 11: INTERFAZ GRÁFICA FRONT-END (HTML, CSS Y VISTAS)
+===============================================================================
+A partir de aquí, el archivo PHP implementa toda la interfaz de usuario, 
+diseño y experiencia (UX). Usa la directiva "Glassmorphism", soporte para
+temas claros/oscuros (Dark Mode) y grillas responsivas.
+-->
 <!DOCTYPE html>
 <html lang="es">
+
 <head>
     <meta charset="utf-8">
     <title>Visor de estudios (Canvas ➜ Orthanc)</title>
@@ -1757,1047 +1954,1439 @@ $downloadSupported = $tmpWritable;
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <!-- Bootstrap Icons -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
-        <!-- Font and Flatpickr -->
+    <!-- Font and Flatpickr -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/themes/airbnb.css">
-    
+
     <style>
-    /* New Styles Injected */
-    :root {
-        --primary: #2563eb;
-        --primary-light: #eff6ff;
-        --primary-hover: #1d4ed8;
-        --success: #10b981;
-        --error: #ef4444;
-        --bg-color: #f8fafc;
-        --card-bg: rgba(255, 255, 255, 0.75);
-        --text-main: #0f172a;
-        --text-muted: #64748b;
-        --border-radius: 20px;
-        --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-    }
+        /* New Styles Injected */
+        :root {
+            --primary: #2563eb;
+            --primary-light: #eff6ff;
+            --primary-hover: #1d4ed8;
+            --success: #10b981;
+            --error: #ef4444;
+            --bg-color: #f8fafc;
+            --card-bg: rgba(255, 255, 255, 0.75);
+            --text-main: #0f172a;
+            --text-muted: #64748b;
+            --border-radius: 20px;
+            --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
 
-    body {
-        font-family: 'Outfit', system-ui, -apple-system, sans-serif;
-        margin: 0;
-        padding: 40px 16px;
-        background: var(--bg-color);
-        background-image: 
-            radial-gradient(at 0% 0%, rgba(37, 99, 235, 0.12) 0px, transparent 50%),
-            radial-gradient(at 100% 0%, rgba(16, 185, 129, 0.08) 0px, transparent 50%),
-            radial-gradient(at 100% 100%, rgba(37, 99, 235, 0.12) 0px, transparent 50%);
-        background-attachment: fixed;
-        color: var(--text-main);
-        min-height: 100vh;
-    }
+        body {
+            font-family: 'Outfit', system-ui, -apple-system, sans-serif;
+            margin: 0;
+            padding: 40px 16px;
+            background: var(--bg-color);
+            background-image:
+                radial-gradient(at 0% 0%, rgba(37, 99, 235, 0.12) 0px, transparent 50%),
+                radial-gradient(at 100% 0%, rgba(16, 185, 129, 0.08) 0px, transparent 50%),
+                radial-gradient(at 100% 100%, rgba(37, 99, 235, 0.12) 0px, transparent 50%);
+            background-attachment: fixed;
+            color: var(--text-main);
+            min-height: 100vh;
+        }
 
-    .layout {
-        max-width: 1080px;
-        margin: 0 auto;
-        position: relative;
-        z-index: 1;
-    }
+        .layout {
+            max-width: 1080px;
+            margin: 0 auto;
+            position: relative;
+            z-index: 1;
+        }
 
-    h1 {
-        margin-top: 0;
-        font-size: 2.2rem;
-        font-weight: 700;
-        color: var(--text-main);
-        letter-spacing: -0.02em;
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        text-shadow: 0 2px 10px rgba(0,0,0,0.02);
-    }
+        h1 {
+            margin-top: 0;
+            font-size: 2.2rem;
+            font-weight: 700;
+            color: var(--text-main);
+            letter-spacing: -0.02em;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            text-shadow: 0 2px 10px rgba(0, 0, 0, 0.02);
+        }
 
-    .topbar {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 24px;
-        font-size: 1rem;
-    }
+        .topbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            font-size: 1rem;
+        }
 
-    .card {
-        background: var(--card-bg);
-        backdrop-filter: blur(24px);
-        -webkit-backdrop-filter: blur(24px);
-        border-radius: var(--border-radius);
-        padding: 28px;
-        margin-bottom: 30px;
-        box-shadow: 0 10px 40px -10px rgba(0, 0, 0, 0.08), inset 0 1px 0 rgba(255,255,255,0.6);
-        border: 1px solid rgba(255, 255, 255, 0.8);
-        transition: var(--transition);
-        position: relative;
-    }
-    
-    /* Stacking context fix for dropdowns */
-    .card:nth-of-type(1) { z-index: 40; }
-    .card:nth-of-type(2) { z-index: 30; }
-    .card:nth-of-type(3) { z-index: 20; }
-    .card:nth-of-type(4) { z-index: 10; }
-    
-    .card:hover {
-        box-shadow: 0 20px 40px -10px rgba(37, 99, 235, 0.12), inset 0 1px 0 rgba(255,255,255,0.8);
-        transform: translateY(-2px);
-    }
+        .card {
+            background: var(--card-bg);
+            backdrop-filter: blur(24px);
+            -webkit-backdrop-filter: blur(24px);
+            border-radius: var(--border-radius);
+            padding: 28px;
+            margin-bottom: 30px;
+            box-shadow: 0 10px 40px -10px rgba(0, 0, 0, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.6);
+            border: 1px solid rgba(255, 255, 255, 0.8);
+            transition: var(--transition);
+            position: relative;
+        }
 
-    .card-header {
-        display: flex;
-        align-items: center;
-        gap: 18px;
-        margin-bottom: 24px;
-        border-bottom: 1px solid rgba(0,0,0,0.04);
-        padding-bottom: 20px;
-    }
+        /* Stacking context fix for dropdowns */
+        .card:nth-of-type(1) {
+            z-index: 40;
+        }
 
-    .card-header-icon {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        width: 52px;
-        height: 52px;
-        border-radius: 16px;
-        background: linear-gradient(135deg, var(--primary-light), #ffffff);
-        color: var(--primary);
-        font-size: 26px;
-        box-shadow: 0 8px 16px rgba(37, 99, 235, 0.12), inset 0 2px 4px rgba(255,255,255,1);
-    }
+        .card:nth-of-type(2) {
+            z-index: 30;
+        }
 
-    h2, h3 {
-        margin: 0;
-        font-size: 1.3rem;
-        font-weight: 600;
-        color: var(--text-main);
-        letter-spacing: -0.01em;
-    }
+        .card:nth-of-type(3) {
+            z-index: 20;
+        }
 
-    .status {
-        margin-top: 12px;
-        margin-bottom: 20px;
-        padding: 14px 18px;
-        border-radius: 14px;
-        font-size: 1rem;
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        font-weight: 500;
-        animation: slideIn 0.4s cubic-bezier(0.16, 1, 0.3, 1);
-        box-shadow: 0 4px 12px rgba(0,0,0,0.03);
-    }
-    
-    @keyframes slideIn {
-        from { opacity: 0; transform: translateY(-15px) scale(0.98); }
-        to { opacity: 1; transform: translateY(0) scale(1); }
-    }
+        .card:nth-of-type(4) {
+            z-index: 10;
+        }
 
-    .status-ok, .alert-success {
-        background: rgba(16, 185, 129, 0.1);
-        color: #065f46;
-        border: 1px solid rgba(16, 185, 129, 0.2);
-    }
+        .card:hover {
+            box-shadow: 0 20px 40px -10px rgba(37, 99, 235, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.8);
+            transform: translateY(-2px);
+        }
 
-    .status-error, .alert-danger {
-        background: rgba(239, 68, 68, 0.1);
-        color: #991b1b;
-        border: 1px solid rgba(239, 68, 68, 0.2);
-    }
+        .card-header {
+            display: flex;
+            align-items: center;
+            gap: 18px;
+            margin-bottom: 24px;
+            border-bottom: 1px solid rgba(0, 0, 0, 0.04);
+            padding-bottom: 20px;
+        }
 
-    label, .form-label {
-        display: block;
-        margin-bottom: 8px;
-        font-weight: 600;
-        color: var(--text-main);
-        font-size: 0.95rem;
-    }
+        .card-header-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 52px;
+            height: 52px;
+            border-radius: 16px;
+            background: linear-gradient(135deg, var(--primary-light), #ffffff);
+            color: var(--primary);
+            font-size: 26px;
+            box-shadow: 0 8px 16px rgba(37, 99, 235, 0.12), inset 0 2px 4px rgba(255, 255, 255, 1);
+        }
 
-    input[type="text"],
-    input[type="date"],
-    input[type="password"],
-    input[type="search"],
-    .form-control {
-        width: 100%;
-        padding: 14px 18px;
-        border-radius: 14px;
-        border: 1px solid #e2e8f0;
-        background: rgba(255,255,255,0.9);
-        font-size: 15px;
-        font-family: inherit;
-        font-weight: 500;
-        transition: var(--transition);
-        box-shadow: inset 0 2px 4px rgba(0,0,0,0.01);
-    }
+        h2,
+        h3 {
+            margin: 0;
+            font-size: 1.3rem;
+            font-weight: 600;
+            color: var(--text-main);
+            letter-spacing: -0.01em;
+        }
 
-    input:focus, .form-control:focus {
-        outline: none;
-        border-color: var(--primary);
-        background: #ffffff;
-        box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.15), inset 0 2px 4px rgba(0,0,0,0.01);
-    }
+        .status {
+            margin-top: 12px;
+            margin-bottom: 20px;
+            padding: 14px 18px;
+            border-radius: 14px;
+            font-size: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-weight: 500;
+            animation: slideIn 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.03);
+        }
 
-    .actions {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 16px;
-        margin-top: 20px;
-        align-items: center;
-    }
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(-15px) scale(0.98);
+            }
 
-    .btn {
-        display: inline-flex;
-        padding: 12px 24px;
-        border: none;
-        border-radius: 14px;
-        text-decoration: none;
-        font-family: inherit;
-        font-weight: 600;
-        font-size: 15px;
-        align-items: center;
-        justify-content: center;
-        gap: 10px;
-        cursor: pointer;
-        transition: var(--transition);
-    }
+            to {
+                opacity: 1;
+                transform: translateY(0) scale(1);
+            }
+        }
 
-    .btn-primary {
-        background: linear-gradient(135deg, var(--primary), var(--primary-hover));
-        color: #ffffff;
-        box-shadow: 0 6px 20px rgba(37, 99, 235, 0.25), inset 0 1px 0 rgba(255,255,255,0.2);
-    }
+        .status-ok,
+        .alert-success {
+            background: rgba(16, 185, 129, 0.1);
+            color: #065f46;
+            border: 1px solid rgba(16, 185, 129, 0.2);
+        }
 
-    .btn-primary:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 8px 25px rgba(37, 99, 235, 0.35), inset 0 1px 0 rgba(255,255,255,0.2);
-        color: #ffffff;
-    }
+        .status-error,
+        .alert-danger {
+            background: rgba(239, 68, 68, 0.1);
+            color: #991b1b;
+            border: 1px solid rgba(239, 68, 68, 0.2);
+        }
 
-    .btn-secondary, .btn-outline-secondary {
-        background: #ffffff;
-        color: var(--text-main);
-        border: 1px solid #e2e8f0;
-        box-shadow: 0 4px 10px rgba(0,0,0,0.04);
-    }
+        label,
+        .form-label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: var(--text-main);
+            font-size: 0.95rem;
+        }
 
-    .btn-secondary:hover, .btn-outline-secondary:hover {
-        background: #f8fafc;
-        transform: translateY(-2px);
-        box-shadow: 0 6px 15px rgba(0,0,0,0.08);
-        border-color: #cbd5e1;
-        color: var(--text-main);
-    }
+        input[type="text"],
+        input[type="date"],
+        input[type="password"],
+        input[type="search"],
+        .form-control {
+            width: 100%;
+            padding: 14px 18px;
+            border-radius: 14px;
+            border: 1px solid #e2e8f0;
+            background: rgba(255, 255, 255, 0.9);
+            font-size: 15px;
+            font-family: inherit;
+            font-weight: 500;
+            transition: var(--transition);
+            box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.01);
+        }
 
-    .btn-outline-success {
-        color: var(--success);
-        border: 1px solid var(--success);
-        background: transparent;
-        box-shadow: 0 4px 10px rgba(16, 185, 129, 0.05);
-    }
+        input:focus,
+        .form-control:focus {
+            outline: none;
+            border-color: var(--primary);
+            background: #ffffff;
+            box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.15), inset 0 2px 4px rgba(0, 0, 0, 0.01);
+        }
 
-    .btn-outline-success:hover {
-        background: var(--success);
-        color: #ffffff;
-        box-shadow: 0 6px 15px rgba(16, 185, 129, 0.25);
-        transform: translateY(-2px);
-    }
-    
-    .btn-outline-primary {
-        color: var(--primary);
-        border: 1px solid var(--primary);
-        background: transparent;
-    }
-    
-    .btn-outline-primary:hover {
-        background: var(--primary);
-        color: #ffffff;
-        box-shadow: 0 6px 15px rgba(37, 99, 235, 0.25);
-        transform: translateY(-2px);
-    }
-    
-    .btn-sm {
-        padding: 8px 16px;
-        font-size: 14px;
-        border-radius: 12px;
-    }
-
-    .hint {
-        font-size: 0.95rem;
-        color: var(--text-muted);
-        margin-top: 8px;
-        line-height: 1.5;
-        font-weight: 400;
-    }
-
-    .table-responsive {
-        border-radius: 16px;
-        background: rgba(255,255,255,0.5);
-        padding: 4px;
-        border: 1px solid rgba(226,232,240,0.6);
-    }
-
-    table {
-        width: 100%;
-        border-collapse: separate;
-        border-spacing: 0 8px;
-        margin-top: 4px;
-        font-size: 14px;
-    }
-
-    th, td {
-        padding: 16px 20px;
-        text-align: left;
-    }
-
-    th {
-        font-weight: 600;
-        color: var(--text-muted);
-        font-size: 0.85rem;
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-        padding-top: 10px;
-        padding-bottom: 4px;
-    }
-    
-    tbody tr {
-        transition: var(--transition);
-        background: #ffffff;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.02);
-    }
-
-    tbody tr:hover {
-        transform: scale(1.005) translateY(-2px);
-        box-shadow: 0 8px 20px rgba(37, 99, 235, 0.08);
-        z-index: 10;
-        position: relative;
-    }
-    
-    tbody td:first-child { border-top-left-radius: 16px; border-bottom-left-radius: 16px; border-left: 2px solid transparent; }
-    tbody td:last-child { border-top-right-radius: 16px; border-bottom-right-radius: 16px; }
-    
-    tbody tr:hover td:first-child { border-left-color: var(--primary); }
-
-    .modality-badge {
-        display: inline-flex;
-        align-items: center;
-        padding: 6px 12px;
-        border-radius: 20px;
-        background: var(--primary-light);
-        color: var(--primary-hover);
-        font-size: 13px;
-        font-weight: 700;
-        letter-spacing: 0.03em;
-        box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.1);
-    }
-
-    .login-error {
-        margin-top: 16px;
-        padding: 14px 18px;
-        border-radius: 14px;
-        background: rgba(239, 68, 68, 0.1);
-        color: #991b1b;
-        font-size: 0.95rem;
-        font-weight: 500;
-        display: flex;
-        align-items: center;
-        gap: 10px;
-    }
-
-    .modality-toggle {
-        text-align: left;
-        cursor: pointer;
-        padding: 14px 18px;
-        border-radius: 14px;
-        background: rgba(255, 255, 255, 0.9);
-        border: 1px solid #e2e8f0;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        font-weight: 500;
-        transition: var(--transition);
-    }
-
-    .modality-toggle:hover {
-        background: #ffffff;
-        border-color: #cbd5e1;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.04);
-    }
-
-    .modality-toggle:focus {
-        box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.15);
-        border-color: var(--primary);
-    }
-
-    .modality-options {
-        background: rgba(255,255,255,0.95);
-        backdrop-filter: blur(16px);
-        -webkit-backdrop-filter: blur(16px);
-        border: 1px solid rgba(226, 232, 240, 0.8);
-        border-radius: 20px;
-        max-height: 320px;
-        overflow-y: auto;
-        box-shadow: 0 20px 40px -10px rgba(0,0,0,0.15);
-        padding: 16px;
-        margin-top: 10px;
-    }
-
-    @media (max-width: 768px) {
-        body { padding: 20px 10px; }
-        .card { padding: 20px; margin-bottom: 20px; }
-        .table-responsive { background: transparent; border: none; padding: 0; }
-        .table-responsive table thead { display: none; }
-        .table-responsive tbody tr { display: flex; flex-direction: column; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; margin-bottom: 16px; padding: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.03); }
-        .table-responsive tbody td { display: flex; justify-content: space-between; align-items: center; padding: 10px 4px; border-bottom: 1px solid #f1f5f9; border-radius: 0 !important; }
-        .table-responsive tbody td:last-child { border-bottom: none; flex-direction: column; align-items: stretch; gap: 10px; margin-top: 10px;}
-        .table-responsive tbody td[data-label]:before { content: attr(data-label); font-weight: 600; color: var(--text-muted); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; }
-    }
-
-    .flatpickr-calendar {
-        font-family: 'Outfit', sans-serif;
-        border-radius: 20px;
-        box-shadow: 0 20px 40px -10px rgba(0,0,0,0.15);
-        border: 1px solid rgba(226,232,240,0.8);
-        padding: 5px;
-    }
-    
-    .bg-shape {
-        position: fixed;
-        border-radius: 50%;
-        filter: blur(80px);
-        z-index: 0;
-        opacity: 0.5;
-        pointer-events: none;
-    }
-    .shape1 { top: -10%; left: -10%; width: 40vw; height: 40vw; background: rgba(37, 99, 235, 0.15); }
-    .shape2 { bottom: -10%; right: -10%; width: 50vw; height: 50vw; background: rgba(16, 185, 129, 0.1); }
-    
-            .page-container {
-        display: flex;
-        align-items: flex-start;
-        max-width: 1400px;
-        margin: 0 auto;
-        padding: 0 10px;
-        gap: 30px;
-    }
-    .logo-container {
-        flex: 0 0 260px;
-        margin: 0;
-        position: sticky;
-        top: 20px;
-        text-align: center;
-    }
-    .logo-container img {
-        width: 100%;
-        max-width: 260px;
-        height: auto;
-    }
-    @media (max-width: 1100px) {
-        .page-container {
-            flex-direction: column;
+        .actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px;
+            margin-top: 20px;
             align-items: center;
         }
-        .logo-container {
+
+        .btn {
+            display: inline-flex;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 14px;
+            text-decoration: none;
+            font-family: inherit;
+            font-weight: 600;
+            font-size: 15px;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            cursor: pointer;
+            transition: var(--transition);
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--primary), var(--primary-hover));
+            color: #ffffff;
+            box-shadow: 0 6px 20px rgba(37, 99, 235, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(37, 99, 235, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+            color: #ffffff;
+        }
+
+        .btn-secondary,
+        .btn-outline-secondary {
+            background: #ffffff;
+            color: var(--text-main);
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.04);
+        }
+
+        .btn-secondary:hover,
+        .btn-outline-secondary:hover {
+            background: #f8fafc;
+            transform: translateY(-2px);
+            box-shadow: 0 6px 15px rgba(0, 0, 0, 0.08);
+            border-color: #cbd5e1;
+            color: var(--text-main);
+        }
+
+        .btn-outline-success {
+            color: var(--success);
+            border: 1px solid var(--success);
+            background: transparent;
+            box-shadow: 0 4px 10px rgba(16, 185, 129, 0.05);
+        }
+
+        .btn-outline-success:hover {
+            background: var(--success);
+            color: #ffffff;
+            box-shadow: 0 6px 15px rgba(16, 185, 129, 0.25);
+            transform: translateY(-2px);
+        }
+
+        .btn-outline-primary {
+            color: var(--primary);
+            border: 1px solid var(--primary);
+            background: transparent;
+        }
+
+        .btn-outline-primary:hover {
+            background: var(--primary);
+            color: #ffffff;
+            box-shadow: 0 6px 15px rgba(37, 99, 235, 0.25);
+            transform: translateY(-2px);
+        }
+
+        .btn-sm {
+            padding: 8px 16px;
+            font-size: 14px;
+            border-radius: 12px;
+        }
+
+        .hint {
+            font-size: 0.95rem;
+            color: var(--text-muted);
+            margin-top: 8px;
+            line-height: 1.5;
+            font-weight: 400;
+        }
+
+        .table-responsive {
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.5);
+            padding: 4px;
+            border: 1px solid rgba(226, 232, 240, 0.6);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0 8px;
+            margin-top: 4px;
+            font-size: 14px;
+        }
+
+        th,
+        td {
+            padding: 16px 20px;
+            text-align: left;
+        }
+
+        th {
+            font-weight: 600;
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            padding-top: 10px;
+            padding-bottom: 4px;
+        }
+
+        tbody tr {
+            transition: var(--transition);
+            background: #ffffff;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.02);
+        }
+
+        tbody tr:hover {
+            transform: scale(1.005) translateY(-2px);
+            box-shadow: 0 8px 20px rgba(37, 99, 235, 0.08);
+            z-index: 10;
             position: relative;
+        }
+
+        tbody td:first-child {
+            border-top-left-radius: 16px;
+            border-bottom-left-radius: 16px;
+            border-left: 2px solid transparent;
+        }
+
+        tbody td:last-child {
+            border-top-right-radius: 16px;
+            border-bottom-right-radius: 16px;
+        }
+
+        tbody tr:hover td:first-child {
+            border-left-color: var(--primary);
+        }
+
+        .modality-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 6px 12px;
+            border-radius: 20px;
+            background: var(--primary-light);
+            color: var(--primary-hover);
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: 0.03em;
+            box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.1);
+        }
+
+        .login-error {
+            margin-top: 16px;
+            padding: 14px 18px;
+            border-radius: 14px;
+            background: rgba(239, 68, 68, 0.1);
+            color: #991b1b;
+            font-size: 0.95rem;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .modality-toggle {
+            text-align: left;
+            cursor: pointer;
+            padding: 14px 18px;
+            border-radius: 14px;
+            background: rgba(255, 255, 255, 0.9);
+            border: 1px solid #e2e8f0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-weight: 500;
+            transition: var(--transition);
+        }
+
+        .modality-toggle:hover {
+            background: #ffffff;
+            border-color: #cbd5e1;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);
+        }
+
+        .modality-toggle:focus {
+            box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.15);
+            border-color: var(--primary);
+        }
+
+        .modality-options {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid rgba(226, 232, 240, 0.8);
+            border-radius: 20px;
+            max-height: 320px;
+            overflow-y: auto;
+            box-shadow: 0 20px 40px -10px rgba(0, 0, 0, 0.15);
+            padding: 16px;
+            margin-top: 10px;
+        }
+
+        @media (max-width: 768px) {
+            body {
+                padding: 20px 10px;
+            }
+
+            .card {
+                padding: 20px;
+                margin-bottom: 20px;
+            }
+
+            .table-responsive {
+                background: transparent;
+                border: none;
+                padding: 0;
+            }
+
+            .table-responsive table thead {
+                display: none;
+            }
+
+            .table-responsive tbody tr {
+                display: flex;
+                flex-direction: column;
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 16px;
+                margin-bottom: 16px;
+                padding: 16px;
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.03);
+            }
+
+            .table-responsive tbody td {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 10px 4px;
+                border-bottom: 1px solid #f1f5f9;
+                border-radius: 0 !important;
+            }
+
+            .table-responsive tbody td:last-child {
+                border-bottom: none;
+                flex-direction: column;
+                align-items: stretch;
+                gap: 10px;
+                margin-top: 10px;
+            }
+
+            .table-responsive tbody td[data-label]:before {
+                content: attr(data-label);
+                font-weight: 600;
+                color: var(--text-muted);
+                font-size: 0.85rem;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+            }
+        }
+
+        .flatpickr-calendar {
+            font-family: 'Outfit', sans-serif;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px -10px rgba(0, 0, 0, 0.15);
+            border: 1px solid rgba(226, 232, 240, 0.8);
+            padding: 5px;
+        }
+
+        .bg-shape {
+            position: fixed;
+            border-radius: 50%;
+            filter: blur(80px);
+            z-index: 0;
+            opacity: 0.5;
+            pointer-events: none;
+        }
+
+        .shape1 {
+            top: -10%;
+            left: -10%;
+            width: 40vw;
+            height: 40vw;
+            background: rgba(37, 99, 235, 0.15);
+        }
+
+        .shape2 {
+            bottom: -10%;
+            right: -10%;
+            width: 50vw;
+            height: 50vw;
+            background: rgba(16, 185, 129, 0.1);
+        }
+
+        .page-container {
+            display: flex;
+            align-items: flex-start;
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 0 10px;
+            gap: 30px;
+        }
+
+        .logo-container {
+            flex: 0 0 260px;
+            margin: 0;
+            position: sticky;
+            top: 20px;
+            text-align: center;
+        }
+
+        .logo-container img {
+            width: 100%;
+            max-width: 260px;
+            height: auto;
+        }
+
+        @media (max-width: 1100px) {
+            .page-container {
+                flex-direction: column;
+                align-items: center;
+            }
+
+            .logo-container {
+                position: relative;
+                top: 0;
+                margin-bottom: 20px;
+            }
+        }
+
+        /* --- Estilos CSS Adicionales para Características Premium (Temas, Modo Oscuro, Layouts) --- */
+        [data-theme="dark"] {
+            --bg-color: #0f172a;
+            --card-bg: rgba(30, 41, 59, 1);
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --bs-secondary-color: #94a3b8;
+            --primary-light: #1e3a8a;
+        }
+
+        [data-theme="dark"] .text-muted {
+            color: #94a3b8 !important;
+        }
+
+        [data-theme="dark"] .bg-shape {
+            opacity: 0.15;
+        }
+
+        [data-theme="dark"] .card {
+            border-color: rgba(255, 255, 255, 0.05);
+        }
+
+        [data-theme="dark"] tbody tr:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        [data-theme="dark"] .modality-options {
+            background: rgba(30, 41, 59, 0.95);
+        }
+
+        [data-theme="dark"] .modality-toggle {
+            background: rgba(30, 41, 59, 0.9);
+            border-color: #334155;
+        }
+
+        [data-theme="dark"] .navbar {
+            background-color: rgba(30, 41, 59, 0.8) !important;
+            color: #f8fafc;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        [data-theme="dark"] .navbar-text {
+            color: #f8fafc !important;
+        }
+
+        [data-theme="dark"] input.form-control,
+        [data-theme="dark"] input[type="text"],
+        [data-theme="dark"] input[type="password"],
+        [data-theme="dark"] input[type="date"] {
+            background: rgba(15, 23, 42, 0.9);
+            color: #fff;
+            border-color: #334155;
+        }
+
+        #loading-overlay {
+            position: fixed;
             top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: rgba(15, 23, 42, 0.7);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            z-index: 99999;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+        }
+
+        #loading-overlay.active {
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        .spinner-ring {
+            width: 60px;
+            height: 60px;
+            border: 4px solid rgba(255, 255, 255, 0.2);
+            border-top-color: #3b82f6;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
             margin-bottom: 20px;
         }
-    }
-        /* --- Premium Features CSS --- */
-    [data-theme="dark"] {
-        --bg-color: #0f172a;
-        --card-bg: rgba(30, 41, 59, 1);
-        --text-main: #f8fafc;
-        --text-muted: #94a3b8;
-        --bs-secondary-color: #94a3b8;
-        --primary-light: #1e3a8a;
-    }
-    
-    [data-theme="dark"] .text-muted {
-        color: #94a3b8 !important;
-    }
-    
-    [data-theme="dark"] .bg-shape { opacity: 0.15; }
-    [data-theme="dark"] .card { border-color: rgba(255,255,255,0.05); }
-    [data-theme="dark"] tbody tr:hover { background: rgba(255,255,255,0.05); }
-    [data-theme="dark"] .modality-options { background: rgba(30,41,59,0.95); }
-    [data-theme="dark"] .modality-toggle { background: rgba(30,41,59,0.9); border-color: #334155; }
-    [data-theme="dark"] .navbar { background-color: rgba(30,41,59,0.8) !important; color: #f8fafc; border: 1px solid rgba(255,255,255,0.1); }
-    [data-theme="dark"] .navbar-text { color: #f8fafc !important; }
-    [data-theme="dark"] input.form-control, [data-theme="dark"] input[type="text"], [data-theme="dark"] input[type="password"], [data-theme="dark"] input[type="date"] {
-        background: rgba(15,23,42,0.9); color: #fff; border-color: #334155;
-    }
 
-    #loading-overlay {
-        position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-        background: rgba(15, 23, 42, 0.7);
-        backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
-        z-index: 99999;
-        display: flex; flex-direction: column; align-items: center; justify-content: center;
-        opacity: 0; pointer-events: none; transition: opacity 0.3s ease;
-    }
-    #loading-overlay.active { opacity: 1; pointer-events: auto; }
-    .spinner-ring {
-        width: 60px; height: 60px;
-        border: 4px solid rgba(255,255,255,0.2); border-top-color: #3b82f6;
-        border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 20px;
-    }
-    @keyframes spin { 100% { transform: rotate(360deg); } }
-    
-    .mod-CT { background: rgba(59, 130, 246, 0.15); color: #2563eb !important; border: 1px solid rgba(59, 130, 246, 0.3); }
-    .mod-MR { background: rgba(139, 92, 246, 0.15); color: #7c3aed !important; border: 1px solid rgba(139, 92, 246, 0.3); }
-    .mod-CR, .mod-DX { background: rgba(16, 185, 129, 0.15); color: #059669 !important; border: 1px solid rgba(16, 185, 129, 0.3); }
-    .mod-US { background: rgba(245, 158, 11, 0.15); color: #d97706 !important; border: 1px solid rgba(245, 158, 11, 0.3); }
-    .mod-MG { background: rgba(236, 72, 153, 0.15); color: #db2777 !important; border: 1px solid rgba(236, 72, 153, 0.3); }
+        @keyframes spin {
+            100% {
+                transform: rotate(360deg);
+            }
+        }
 
-    [data-theme="dark"] .mod-CT { color: #93c5fd !important; }
-    [data-theme="dark"] .mod-MR { color: #c4b5fd !important; }
-    [data-theme="dark"] .mod-CR, [data-theme="dark"] .mod-DX { color: #6ee7b7 !important; }
-    [data-theme="dark"] .mod-US { color: #fcd34d !important; }
-    [data-theme="dark"] .mod-MG { color: #f9a8d4 !important; }
+        .mod-CT {
+            background: rgba(59, 130, 246, 0.15);
+            color: #2563eb !important;
+            border: 1px solid rgba(59, 130, 246, 0.3);
+        }
 
-    /* Fixes for forms and tables in dark mode */
-    [data-theme="dark"] .card { background: var(--card-bg); color: var(--text-main); }
-    [data-theme="dark"] .form-floating > label { color: var(--text-muted); }
-    [data-theme="dark"] .form-floating > .form-control:focus ~ label,
-    [data-theme="dark"] .form-floating > .form-control:not(:placeholder-shown) ~ label {
-        color: var(--primary); background: transparent;
-    }
-    
-    [data-theme="dark"] .btn-outline-secondary { background: rgba(30,41,59,0.9); border-color: #334155; color: var(--text-main); }
-    [data-theme="dark"] .btn-outline-secondary:hover { background: #334155; color: #fff; }
-    [data-theme="dark"] .btn-light { background: rgba(30,41,59,0.9); border-color: #334155; color: var(--text-main); }
-    [data-theme="dark"] .btn-secondary, [data-theme="dark"] .btn-outline-success { background: rgba(30,41,59,0.9); color: var(--text-main); }
-    [data-theme="dark"] .btn-outline-success { border-color: #10b981; color: #10b981; }
-    [data-theme="dark"] .btn-outline-success:hover { background: #10b981; color: #fff; }
-    [data-theme="dark"] .btn-secondary { border-color: #64748b; }
-    
-    [data-theme="dark"] .table-responsive { background: var(--card-bg) !important; border-color: rgba(255,255,255,0.05); }
-    [data-theme="dark"] .table { --bs-table-bg: transparent; --bs-table-color: var(--text-main); --bs-table-striped-bg: rgba(255,255,255,0.02); color: var(--text-main); }
-    [data-theme="dark"] .table thead th { background: rgba(15,23,42,0.8); color: var(--text-muted) !important; border-bottom: 2px solid #334155; }
-    [data-theme="dark"] tbody tr { background: transparent !important; color: var(--text-main) !important; }
-    [data-theme="dark"] tbody tr td { color: var(--text-main) !important; border-bottom-color: rgba(255,255,255,0.05) !important; }
-    [data-theme="dark"] tbody tr:hover { background: rgba(255,255,255,0.05) !important; }
-    
-    @media (max-width: 768px) {
-        [data-theme="dark"] .table-responsive tbody tr { background: rgba(30,41,59,0.95); border-color: #334155; }
-        [data-theme="dark"] .table-responsive tbody td { border-bottom-color: rgba(255,255,255,0.05); }
-    }
+        .mod-MR {
+            background: rgba(139, 92, 246, 0.15);
+            color: #7c3aed !important;
+            border: 1px solid rgba(139, 92, 246, 0.3);
+        }
+
+        .mod-CR,
+        .mod-DX {
+            background: rgba(16, 185, 129, 0.15);
+            color: #059669 !important;
+            border: 1px solid rgba(16, 185, 129, 0.3);
+        }
+
+        .mod-US {
+            background: rgba(245, 158, 11, 0.15);
+            color: #d97706 !important;
+            border: 1px solid rgba(245, 158, 11, 0.3);
+        }
+
+        .mod-MG {
+            background: rgba(236, 72, 153, 0.15);
+            color: #db2777 !important;
+            border: 1px solid rgba(236, 72, 153, 0.3);
+        }
+
+        [data-theme="dark"] .mod-CT {
+            color: #93c5fd !important;
+        }
+
+        [data-theme="dark"] .mod-MR {
+            color: #c4b5fd !important;
+        }
+
+        [data-theme="dark"] .mod-CR,
+        [data-theme="dark"] .mod-DX {
+            color: #6ee7b7 !important;
+        }
+
+        [data-theme="dark"] .mod-US {
+            color: #fcd34d !important;
+        }
+
+        [data-theme="dark"] .mod-MG {
+            color: #f9a8d4 !important;
+        }
+
+        /* Ajustes visuales de compatibilidad de inputs y layouts para el Modo Oscuro */
+        [data-theme="dark"] .card {
+            background: var(--card-bg);
+            color: var(--text-main);
+        }
+
+        [data-theme="dark"] .form-floating>label {
+            color: var(--text-muted);
+        }
+
+        [data-theme="dark"] .form-floating>.form-control:focus~label,
+        [data-theme="dark"] .form-floating>.form-control:not(:placeholder-shown)~label {
+            color: var(--primary);
+            background: transparent;
+        }
+
+        [data-theme="dark"] .btn-outline-secondary {
+            background: rgba(30, 41, 59, 0.9);
+            border-color: #334155;
+            color: var(--text-main);
+        }
+
+        [data-theme="dark"] .btn-outline-secondary:hover {
+            background: #334155;
+            color: #fff;
+        }
+
+        [data-theme="dark"] .btn-light {
+            background: rgba(30, 41, 59, 0.9);
+            border-color: #334155;
+            color: var(--text-main);
+        }
+
+        [data-theme="dark"] .btn-secondary,
+        [data-theme="dark"] .btn-outline-success {
+            background: rgba(30, 41, 59, 0.9);
+            color: var(--text-main);
+        }
+
+        [data-theme="dark"] .btn-outline-success {
+            border-color: #10b981;
+            color: #10b981;
+        }
+
+        [data-theme="dark"] .btn-outline-success:hover {
+            background: #10b981;
+            color: #fff;
+        }
+
+        [data-theme="dark"] .btn-secondary {
+            border-color: #64748b;
+        }
+
+        [data-theme="dark"] .table-responsive {
+            background: var(--card-bg) !important;
+            border-color: rgba(255, 255, 255, 0.05);
+        }
+
+        [data-theme="dark"] .table {
+            --bs-table-bg: transparent;
+            --bs-table-color: var(--text-main);
+            --bs-table-striped-bg: rgba(255, 255, 255, 0.02);
+            color: var(--text-main);
+        }
+
+        [data-theme="dark"] .table thead th {
+            background: rgba(15, 23, 42, 0.8);
+            color: var(--text-muted) !important;
+            border-bottom: 2px solid #334155;
+        }
+
+        [data-theme="dark"] tbody tr {
+            background: transparent !important;
+            color: var(--text-main) !important;
+        }
+
+        [data-theme="dark"] tbody tr td {
+            color: var(--text-main) !important;
+            border-bottom-color: rgba(255, 255, 255, 0.05) !important;
+        }
+
+        [data-theme="dark"] tbody tr:hover {
+            background: rgba(255, 255, 255, 0.05) !important;
+        }
+
+        @media (max-width: 768px) {
+            [data-theme="dark"] .table-responsive tbody tr {
+                background: rgba(30, 41, 59, 0.95);
+                border-color: #334155;
+            }
+
+            [data-theme="dark"] .table-responsive tbody td {
+                border-bottom-color: rgba(255, 255, 255, 0.05);
+            }
+        }
     </style>
 </head>
+
 <body>
     <div class="bg-shape shape1"></div>
     <div class="bg-shape shape2"></div>
-        <div class="page-container">
+    <div class="page-container">
         <div class="logo-container">
             <img src="/buscador/logo.png" alt="Logo">
         </div>
         <div class="layout" style="margin: 0; width: 100%;">
-        <link rel="stylesheet" href="/buscador/assets/css/remoto1.css">
+            <link rel="stylesheet" href="/buscador/assets/css/remoto1.css">
 
-    <?php if (!isset($_SESSION['user'])): ?>
+            <?php if (!isset($_SESSION['user'])): ?>
 
-        <h1>Acceso al visor de estudios</h1>
-        <div class="card">
-            <div class="card-header">
-                <div class="card-header-icon">🔐</div>
-                <div>
-                    <h2 style="margin:0;font-size:1.05rem;">Iniciar sesión</h2>
-                    <p class="hint">Solo personal autorizado puede acceder al visor de estudios.</p>
-                </div>
-            </div>
-
-            <form method="post" onsubmit="showSpinner()">
-                <input type="hidden" name="action" value="login">
-                <div class="mb-3">
-                    <label class="form-label" for="username">Usuario</label>
-                    <input type="text" class="form-control" id="username" name="username" required>
-                </div>
-
-                <div class="mb-3">
-                    <label class="form-label" for="password">Contraseña</label>
-                    <input type="password" class="form-control" id="password" name="password" required>
-                </div>
-
-                <div class="d-flex gap-2 mt-3">
-                    <button type="submit" class="btn btn-primary">
-                        <span>➡️</span><span>Ingresar</span>
-                    </button>
-                </div>
-
-                <?php if ($loginError !== ''): ?>
-                    <div class="alert alert-danger mt-3">
-                        <?php echo htmlspecialchars($loginError, ENT_QUOTES); ?>
-                    </div>
-                <?php endif; ?>
-            </form>
-        </div>
-
-    <?php else: ?>
-
-        <nav class="navbar navbar-light bg-light mb-4 p-2 rounded">
-            <span class="navbar-text">Conectado como <strong><?php echo htmlspecialchars($_SESSION['user'], ENT_QUOTES); ?></strong></span>
-            <div class="d-flex align-items-center"><button type="button" id="theme-toggle" class="btn btn-outline-secondary btn-sm me-2" title="Cambiar tema">🌙</button>
-            <a href="?logout=1" class="btn btn-outline-danger btn-sm"><i class="bi bi-box-arrow-right"></i> Cerrar sesión</a></div>
-        </nav>
-
-        <h1 class="mb-4"><span style="font-size:1.5em;">🩻</span> Visor de estudios (Canvas ➜ Orthanc)</h1>
-        <div class="container">
-            <div class="row justify-content-center">
-                <div class="col-12">
-
-        
-
-        <div class="card">
-            <div class="card-header">
-                <div class="card-header-icon">🔎</div>
-                <div>
-                    <h2 style="margin:0;font-size:1.05rem;">Buscar y cargar estudios por CEDULA de paciente</h2>
-                    <p class="hint">
-                        Primero se buscan estudios en Orthanc. Si falta algo en el rango de fechas indicado,
-                        se trae automáticamente desde Canvas.
-                    </p>
-                </div>
-            </div>
-
-            <form method="get" onsubmit="showSpinner()">
-
-                <div class="row g-2 align-items-end">
-                    <div class="col-12 col-md-6">
-                        <div class="form-floating mb-2">
-                            <input type="text" class="form-control" id="patient_id" name="patient_id" placeholder="ID de paciente" value="<?php echo htmlspecialchars($patientIdValue, ENT_QUOTES); ?>">
-                            <label for="patient_id">ID de paciente (PatientID)</label>
+                <h1>Acceso al visor de estudios</h1>
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-header-icon">🔐</div>
+                        <div>
+                            <h2 style="margin:0;font-size:1.05rem;">Iniciar sesión</h2>
+                            <p class="hint">Solo personal autorizado puede acceder al visor de estudios.</p>
                         </div>
                     </div>
 
-                    <div class="col-6 col-md-3">
-                        <div class="form-floating mb-2">
-                            <input type="date" class="form-control" id="date_from" name="date_from" value="<?php echo htmlspecialchars($dateFromValue, ENT_QUOTES); ?>">
-                            <label for="date_from">Desde</label>
+                    <form method="post" onsubmit="showSpinner()">
+                        <input type="hidden" name="action" value="login">
+                        <div class="mb-3">
+                            <label class="form-label" for="username">Usuario</label>
+                            <input type="text" class="form-control" id="username" name="username" required>
                         </div>
-                    </div>
 
-                    <div class="col-6 col-md-3">
-                        <div class="form-floating mb-2">
-                            <input type="date" class="form-control" id="date_to" name="date_to" value="<?php echo htmlspecialchars($dateToValue, ENT_QUOTES); ?>">
-                            <label for="date_to">Hasta</label>
+                        <div class="mb-3">
+                            <label class="form-label" for="password">Contraseña</label>
+                            <input type="password" class="form-control" id="password" name="password" required>
                         </div>
-                    </div>
-                    <div class="col-12">
-                        <div class="date-presets mb-2">
-                            <button type="button" class="btn btn-sm btn-outline-secondary" id="preset-today">Hoy</button>
-                            <button type="button" class="btn btn-sm btn-outline-secondary" id="preset-yesterday">Ayer</button>
-                            <button type="button" class="btn btn-sm btn-outline-secondary" id="preset-7">Últimos 7 días</button>
-                            <button type="button" class="btn btn-sm btn-outline-secondary" id="preset-30">Últimos 30 días</button>
-                            <button type="button" class="btn btn-sm btn-outline-secondary" id="preset-clear">Limpiar</button>
-                        </div>
-                    </div>
-                </div>
 
-                <div class="row">
-                    <div class="col-12 col-md-6">
-                        <label for="modalities" class="form-label">Modalidades (opcional)</label>
-                        <div class="modality-filter">
-                            <div class="dropdown" data-bs-auto-close="outside">
-                                <button type="button" id="modality-toggle" class="btn btn-outline-secondary dropdown-toggle w-100 text-start" data-bs-toggle="dropdown" aria-expanded="false">Seleccionar modalidades</button>
-                                <div id="modality-options" class="dropdown-menu p-3 modality-options" aria-labelledby="modality-toggle">
-                                    <div class="modality-search">
-                                        <input type="search" id="modality-filter" class="form-control form-control-sm" placeholder="Buscar modalidad...">
-                                    </div>
-                                    <div class="modality-controls">
-                                        <button type="button" id="modality-select-all" class="btn btn-sm btn-outline-primary">Seleccionar todo</button>
-                                        <button type="button" id="modality-clear" class="btn btn-sm btn-outline-secondary">Limpiar</button>
-                                        <button type="button" id="modality-view-all" class="btn btn-sm btn-outline-info">Ver todos</button>
-                                    </div>
-                                <?php foreach ($allModalities as $mod): ?>
-                                        <div class="modality-option">
-                                            <?php $safeMod = htmlspecialchars($mod, ENT_QUOTES); $isSel = in_array($mod, $selectedModalities); ?>
-                                            <button type="button" class="btn btn-sm btn-light w-100 text-start modality-item<?php echo $isSel ? ' selected' : ''; ?>" data-value="<?php echo $safeMod; ?>"><?php echo $safeMod; ?></button>
-                                            <?php if ($isSel): ?>
-                                                <input type="hidden" name="modalities[]" value="<?php echo $safeMod; ?>">
-                                            <?php endif; ?>
-                                        </div>
-                                <?php endforeach; ?>
-                                </div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                    
-                <div class="actions mt-2">
-                    <button type="submit" class="btn btn-primary">
-                        <i class="bi bi-arrow-repeat me-1"></i>
-                        <span>Cargar / actualizar estudios</span>
-                    </button>
-                    <span class="hint">Solo se cargarán desde Canvas los estudios que aún no existan en Orthanc para ese rango.</span>
-                </div>
-            </form>
-        </div>
-
-        <div class="card">
-            <div class="card-header d-flex align-items-center">
-                <div class="card-header-icon">🩻</div>
-                <div>
-                    <h3 style="margin:0;font-size:1.0rem;">Estudios encontrados en Orthanc para este paciente</h3>
-                    <p class="hint">Haz clic en “Ver en OHIF” para abrir el estudio en el visor web.</p>
-                </div>
-                <div class="ms-auto">
-                    <form method="get" id="per-page-form" class="d-flex align-items-center">
-                        <input type="hidden" name="patient_id" value="<?php echo htmlspecialchars($patientIdValue, ENT_QUOTES); ?>">
-                        <input type="hidden" name="date_from" value="<?php echo htmlspecialchars($dateFromValue, ENT_QUOTES); ?>">
-                        <input type="hidden" name="date_to" value="<?php echo htmlspecialchars($dateToValue, ENT_QUOTES); ?>">
-                        <input type="hidden" name="sort" value="<?php echo htmlspecialchars($sort, ENT_QUOTES); ?>">
-                        <input type="hidden" name="page" value="1">
-                        <?php if (!empty($forceRemote)): ?>
-                            <input type="hidden" name="force_remote" value="1">
-                        <?php endif; ?>
-                        <?php foreach ($selectedModalities as $m): ?>
-                            <input type="hidden" name="modalities[]" value="<?php echo htmlspecialchars($m, ENT_QUOTES); ?>">
-                        <?php endforeach; ?>
-                        <div class="btn-group">
-                            <input type="hidden" id="per_page_input" name="per_page" value="<?php echo $perPage; ?>">
-                            <button type="button" class="btn btn-sm btn-outline-secondary dropdown-toggle per-page-btn" data-bs-toggle="dropdown" aria-expanded="false">
-                                <i class="bi bi-list-ul"></i>
-                                <span class="visually-hidden">Filas</span>
-                                <span class="fw-bold ms-1 per-page-label"><?php echo $perPage; ?></span>
+                        <div class="d-flex gap-2 mt-3">
+                            <button type="submit" class="btn btn-primary">
+                                <span>➡️</span><span>Ingresar</span>
                             </button>
-                            <ul class="dropdown-menu dropdown-menu-end">
-                                <li><button class="dropdown-item per-page-option" data-value="10">10</button></li>
-                                <li><button class="dropdown-item per-page-option" data-value="25">25</button></li>
-                                <li><button class="dropdown-item per-page-option" data-value="50">50</button></li>
-                                <li><button class="dropdown-item per-page-option" data-value="100">100</button></li>
-                            </ul>
                         </div>
+
+                        <?php if ($loginError !== ''): ?>
+                            <div class="alert alert-danger mt-3">
+                                <?php echo htmlspecialchars($loginError, ENT_QUOTES); ?>
+                            </div>
+                            <?php
+                        endif; ?>
                     </form>
                 </div>
-            </div>
 
-            <div class="results-inner">
-                <?php if (!empty($studies)): ?>
-                    <div class="table-responsive">
-                        <table class="table table-sm table-striped table-hover">
-                    <thead>
-                    <tr>
-                        <th><a href="?sort=date&page=1&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?>" style="color: inherit; text-decoration: none;">Fecha<?php if ($sort === 'date') echo ($_SESSION['sort_order'] === 'asc' ? ' ↑' : ' ↓'); ?></a></th>
-                        <th>ID Paciente</th>
-                        <th><a href="?sort=name&page=1&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?>" style="color: inherit; text-decoration: none;">Nombre<?php if ($sort === 'name') echo ($_SESSION['sort_order'] === 'asc' ? ' ↑' : ' ↓'); ?></a></th>
-                        <th>Hora</th>
-                        <th>Modalidad(es)</th>
-                        <th>Descripción</th>
-                        <th>Acciones</th>
-                    </tr>
-                    </thead>
-                    <tbody>
-                    <?php foreach ($studies as $s): ?>
-                        <?php
-                        $tags     = array_merge($s['MainDicomTags'] ?? [], $s['PatientMainDicomTags'] ?? []);
-                        $studyUid = $tags['StudyInstanceUID'] ?? null;
+                <?php
+            else: ?>
 
-                        // Obtener datos completos del estudio desde Orthanc para asegurar PatientID y PatientName
-                        if ($studyUid) {
-                            $fullTags = getOrthancStudyFullData($studyUid);
-                            if ($fullTags && is_array($fullTags)) {
-                                // Enriquecer tags con datos completos de Orthanc
-                                $tags = array_merge($tags, $fullTags['MainDicomTags'] ?? [], $fullTags['PatientMainDicomTags'] ?? $fullTags);
-                            }
-                        }
+                <nav class="navbar navbar-light bg-light mb-4 p-2 rounded">
+                    <span class="navbar-text">Conectado como
+                        <strong>
+                            <?php echo htmlspecialchars($_SESSION['user'], ENT_QUOTES); ?>
+                        </strong></span>
+                    <div class="d-flex align-items-center"><button type="button" id="theme-toggle"
+                            class="btn btn-outline-secondary btn-sm me-2" title="Cambiar tema">🌙</button>
+                        <a href="?logout=1" class="btn btn-outline-danger btn-sm"><i class="bi bi-box-arrow-right"></i>
+                            Cerrar sesión</a>
+                    </div>
+                </nav>
 
-                        $rawDate  = pickTag($tags, ['StudyDate', '0008,0020']);
-                        $rawTime  = pickTag($tags, ['StudyTime', 'SeriesTime', 'AcquisitionTime', '0008,0030']) ?: ($s['StudyTime'] ?? '');
-                        $desc     = pickTag($tags, ['StudyDescription', 'SeriesDescription', 'ProtocolName']);
-                        // Obtener PatientID y PatientName por separado (sin fallback cruzado)
-                        // Si la búsqueda fue por PatientID, usar ese valor como ID mostrado
-                        $patientId = $patientIdValue !== '' ? $patientIdValue : pickTag($tags, ['PatientID', '0010,0020']);
-                        // Si tenemos $globalPatientName desde la query Patient, usarlo como nombre
-                        $patientName = !empty($globalPatientName) ? $globalPatientName : pickTag($tags, ['PatientName', '0010,0010', 'Patient']);
-                        $patientName = $patientName !== '' ? str_replace('^', ' ', $patientName) : '';
-                        $patientName = preg_replace('/^PatientName\s+String\s+/i', '', $patientName);
-                        // Si no obtuvimos nombre en la respuesta inicial, intentar obtenerlo desde los tags completos del estudio en Orthanc
-                        if (($patientName === '' || strtolower($patientName) === 'sin nombre') && $studyUid) {
-                            $full = getOrthancStudyFullData($studyUid);
-                            if (!empty($full) && isset($full['PatientMainDicomTags']['PatientName']) && $full['PatientMainDicomTags']['PatientName'] !== '') {
-                                $tempName = $full['PatientMainDicomTags']['PatientName'];
-                                if (is_array($tempName)) {
-                                    if (isset($tempName['Alphabetic'])) {
-                                        $tempName = (string) $tempName['Alphabetic'];
-                                    } else {
-                                        $tempName = implode(' ', array_filter(array_map('strval', $tempName)));
-                                    }
-                                } else {
-                                    $tempName = (string) $tempName;
-                                }
-                                $patientName = str_replace('^', ' ', $tempName);
-                                $patientName = preg_replace('/^PatientName\s+String\s+/i', '', $patientName);
-                            }
-                        }
-                        if (empty($tags['ModalitiesInStudy']) && !empty($s['_local']) && $studyUid) {
-                            $full = getOrthancStudyFullData($studyUid);
-                            if ($full && isset($full['MainDicomTags']['ModalitiesInStudy'])) {
-                                $tags['ModalitiesInStudy'] = $full['MainDicomTags']['ModalitiesInStudy'];
-                            }
-                        }
-                        if ($patientName === '') {
-                            $patientName = 'Sin nombre';
-                        }
-                        $dateText = formatDicomDate($rawDate);
-                        $timeText = formatDicomTime($rawTime);
+                <h1 class="mb-4"><span style="font-size:1.5em;">🩻</span> Visor de estudios (Canvas ➜ Orthanc)</h1>
+                <div class="container">
+                    <div class="row justify-content-center">
+                        <div class="col-12">
 
-                        $mods = '';
-                        if (!empty($tags['ModalitiesInStudy']) && is_array($tags['ModalitiesInStudy'])) {
-                            $mods = implode(',', $tags['ModalitiesInStudy']);
-                        } else {
-                            $modFromTags = $tags['Modality'] ?? '';
-                            $modFromStudy = $s['Modality'] ?? '';
-                            if (!empty($modFromTags)) {
-                                $mods = $modFromTags;
-                            } elseif (!empty($modFromStudy)) {
-                                $mods = $modFromStudy;
-                            } elseif (isset($s['00080060']['Value'][0])) {
-                                $mods = $s['00080060']['Value'][0];
-                            }
-                        }
 
-                        // Mapear códigos DICOM a abreviaturas
-                        $modList = explode(',', $mods);
-                        $mappedMods = array_map(function($m) use ($modalityMap) {
-                            $trimmed = trim($m);
-                            return $modalityMap[$trimmed] ?? $trimmed;
-                        }, $modList);
-                        $mods = implode(',', $mappedMods);
 
-                        if (!$mods && $studyUid) {
-                            // fetch modalities from Orthanc
-                            try {
-                                $series = callOrthanc('GET', '/studies/' . urlencode($studyUid) . '/series');
-                                if (is_array($series)) {
-                                    $modalities = [];
-                                    foreach ($series as $ser) {
-                                        if (isset($ser['MainDicomTags']['Modality'])) {
-                                            $modalities[] = $ser['MainDicomTags']['Modality'];
-                                        }
-                                    }
-                                    $modalities = array_unique($modalities);
-                                    if (!empty($modalities)) {
-                                        $mods = implode(',', $modalities);
-                                        $modList = explode(',', $mods);
-                                        $mappedMods = array_map(function($m) use ($modalityMap) {
-                                            $trimmed = trim($m);
-                                            return $modalityMap[$trimmed] ?? $trimmed;
-                                        }, $modList);
-                                        $mods = implode(',', $mappedMods);
-                                    }
-                                }
-                            } catch (Exception $e) {
-                                // ignore if study not found
-                            }
-                        }
-
-                        if (!$mods) {
-                            // Inferir modalidad desde la descripción
-                            $inferred = getInferredModality($desc);
-                            $mods = $inferred ?: 'N/D';
-                        }
-
-                        $studyUid = $tags['StudyInstanceUID'] ?? null;
-                        ?>
-                            <tr>
-                                <td data-label="Fecha"><?php echo htmlspecialchars($dateText ?: 'N/D', ENT_QUOTES); ?></td>
-                                <td data-label="ID Paciente"><?php echo htmlspecialchars($patientId ?: 'N/D', ENT_QUOTES); ?></td>
-                                <td data-label="Nombre"><?php echo htmlspecialchars($patientName ?: 'N/D', ENT_QUOTES); ?></td>
-                                <td data-label="Hora"><?php echo htmlspecialchars($timeText ?: 'N/D', ENT_QUOTES); ?></td>
-                            <td data-label="Modalidad(es)">
-                                                                <?php if ($mods): ?>
-                                    <div class="d-flex flex-wrap gap-1">
-                                    <?php $modArray = explode(',', $mods); ?>
-                                    <?php foreach ($modArray as $m): $m = trim($m); ?>
-                                        <span class="modality-badge mod-<?php echo htmlspecialchars($m, ENT_QUOTES); ?>">
-                                            <?php echo htmlspecialchars($m, ENT_QUOTES); ?>
-                                        </span>
-                                    <?php endforeach; ?>
+                            <div class="card">
+                                <div class="card-header">
+                                    <div class="card-header-icon">🔎</div>
+                                    <div>
+                                        <h2 style="margin:0;font-size:1.05rem;">Buscar y cargar estudios por CEDULA de
+                                            paciente</h2>
+                                        <p class="hint">
+                                            Primero se buscan estudios en Orthanc. Si falta algo en el rango de fechas
+                                            indicado,
+                                            se trae automáticamente desde Canvas.
+                                        </p>
                                     </div>
-                                <?php else: ?>
-                                    <span class="modality-badge">N/D</span>
-                                <?php endif; ?>
-                            </td>
-                            <td><?php echo htmlspecialchars($desc, ENT_QUOTES); ?></td>
-                            <td data-label="Acciones">
-                                <?php if ($studyUid): ?>
-                                    <?php if (!empty($s['_local'])): ?>
-                                        <a href="?action=view&study_uid=<?php echo urlencode($studyUid); ?>" target="_blank" rel="noopener noreferrer" class="btn btn-secondary btn-sm btn-visualize" data-bs-toggle="tooltip" title="Visualizar estudio">
-                                            <i class="bi bi-eye"></i> Visualizar
-                                        </a>
-                                        <a href="?action=download&study_uid=<?php echo urlencode($studyUid); ?>&download_now=1" class="btn btn-outline-success btn-sm ms-1 btn-download" title="Descargar imágenes JPG">
-                                            <i class="bi bi-download"></i> Descargar
-                                        </a>
-                                    <?php else: ?>
-                                        <a href="?action=view&study_uid=<?php echo urlencode($studyUid); ?>&query_id=<?php echo urlencode($s['_remote']['queryId'] ?? ($_SESSION['last_query']['id'] ?? '')); ?>&answer_idx=<?php echo urlencode($s['_remote']['answerIdx'] ?? ''); ?>" target="_blank" rel="noopener noreferrer" class="btn btn-secondary btn-sm btn-visualize" data-bs-toggle="tooltip" title="Visualizar estudio (traer desde Canvas)">
-                                            <i class="bi bi-eye"></i> Visualizar
-                                        </a>
-                                        <a href="?action=download&study_uid=<?php echo urlencode($studyUid); ?>&query_id=<?php echo urlencode($s['_remote']['queryId'] ?? ($_SESSION['last_query']['id'] ?? '')); ?>&answer_idx=<?php echo urlencode($s['_remote']['answerIdx'] ?? ''); ?>" class="btn btn-outline-success btn-sm ms-1 btn-download" title="Descargar imágenes JPG">
-                                            <i class="bi bi-download"></i> Descargar
-                                        </a>
-                                        <div class="small text-muted mt-1">Si el estudio no está en Orthanc se iniciará su traslado y se esperará antes de descargar.</div>
-                                    <?php endif; ?>
-                                <?php else: ?>
-                                    <em>Sin UID de estudio</em>
-                                <?php endif; ?>
-                            </td>
-                        </tr>
-                    <?php endforeach; ?>
-                    </tbody>
-                        </table>
+                                </div>
+
+                                <form method="get" onsubmit="showSpinner()">
+
+                                    <div class="row g-2 align-items-end">
+                                        <div class="col-12 col-md-6">
+                                            <div class="form-floating mb-2">
+                                                <input type="text" class="form-control" id="patient_id" name="patient_id"
+                                                    placeholder="ID de paciente"
+                                                    value="<?php echo htmlspecialchars($patientIdValue, ENT_QUOTES); ?>">
+                                                <label for="patient_id">ID de paciente (PatientID)</label>
+                                            </div>
+                                        </div>
+
+                                        <div class="col-6 col-md-3">
+                                            <div class="form-floating mb-2">
+                                                <input type="date" class="form-control" id="date_from" name="date_from"
+                                                    value="<?php echo htmlspecialchars($dateFromValue, ENT_QUOTES); ?>">
+                                                <label for="date_from">Desde</label>
+                                            </div>
+                                        </div>
+
+                                        <div class="col-6 col-md-3">
+                                            <div class="form-floating mb-2">
+                                                <input type="date" class="form-control" id="date_to" name="date_to"
+                                                    value="<?php echo htmlspecialchars($dateToValue, ENT_QUOTES); ?>">
+                                                <label for="date_to">Hasta</label>
+                                            </div>
+                                        </div>
+                                        <div class="col-12">
+                                            <div class="date-presets mb-2">
+                                                <button type="button" class="btn btn-sm btn-outline-secondary"
+                                                    id="preset-today">Hoy</button>
+                                                <button type="button" class="btn btn-sm btn-outline-secondary"
+                                                    id="preset-yesterday">Ayer</button>
+                                                <button type="button" class="btn btn-sm btn-outline-secondary"
+                                                    id="preset-7">Últimos 7 días</button>
+                                                <button type="button" class="btn btn-sm btn-outline-secondary"
+                                                    id="preset-30">Últimos 30 días</button>
+                                                <button type="button" class="btn btn-sm btn-outline-secondary"
+                                                    id="preset-clear">Limpiar</button>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div class="row">
+                                        <div class="col-12 col-md-6">
+                                            <label for="modalities" class="form-label">Modalidades (opcional)</label>
+                                            <div class="modality-filter">
+                                                <div class="dropdown" data-bs-auto-close="outside">
+                                                    <button type="button" id="modality-toggle"
+                                                        class="btn btn-outline-secondary dropdown-toggle w-100 text-start"
+                                                        data-bs-toggle="dropdown" aria-expanded="false">Seleccionar
+                                                        modalidades</button>
+                                                    <div id="modality-options" class="dropdown-menu p-3 modality-options"
+                                                        aria-labelledby="modality-toggle">
+                                                        <div class="modality-search">
+                                                            <input type="search" id="modality-filter"
+                                                                class="form-control form-control-sm"
+                                                                placeholder="Buscar modalidad...">
+                                                        </div>
+                                                        <div class="modality-controls">
+                                                            <button type="button" id="modality-select-all"
+                                                                class="btn btn-sm btn-outline-primary">Seleccionar
+                                                                todo</button>
+                                                            <button type="button" id="modality-clear"
+                                                                class="btn btn-sm btn-outline-secondary">Limpiar</button>
+                                                            <button type="button" id="modality-view-all"
+                                                                class="btn btn-sm btn-outline-info">Ver todos</button>
+                                                        </div>
+                                                        <?php foreach ($allModalities as $mod): ?>
+                                                            <div class="modality-option">
+                                                                <?php $safeMod = htmlspecialchars($mod, ENT_QUOTES);
+                                                                $isSel = in_array($mod, $selectedModalities); ?>
+                                                                <button type="button"
+                                                                    class="btn btn-sm btn-light w-100 text-start modality-item<?php echo $isSel ? ' selected' : ''; ?>"
+                                                                    data-value="<?php echo $safeMod; ?>">
+                                                                    <?php echo $safeMod; ?>
+                                                                </button>
+                                                                <?php if ($isSel): ?>
+                                                                    <input type="hidden" name="modalities[]"
+                                                                        value="<?php echo $safeMod; ?>">
+                                                                    <?php
+                                                                endif; ?>
+                                                            </div>
+                                                            <?php
+                                                        endforeach; ?>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                            </div>
+
+
+                            <div class="actions mt-2">
+                                <button type="submit" class="btn btn-primary">
+                                    <i class="bi bi-arrow-repeat me-1"></i>
+                                    <span>Cargar / actualizar estudios</span>
+                                </button>
+                                <span class="hint">Solo se cargarán desde Canvas los estudios que aún no existan en Orthanc
+                                    para ese rango.</span>
+                            </div>
+                            </form>
+                        </div>
+
+                        <div class="card">
+                            <div class="card-header d-flex align-items-center">
+                                <div class="card-header-icon">🩻</div>
+                                <div>
+                                    <h3 style="margin:0;font-size:1.0rem;">Estudios encontrados en Orthanc para este
+                                        paciente</h3>
+                                    <p class="hint">Haz clic en “Ver en OHIF” para abrir el estudio en el visor web.</p>
+                                </div>
+                                <div class="ms-auto">
+                                    <form method="get" id="per-page-form" class="d-flex align-items-center">
+                                        <input type="hidden" name="patient_id"
+                                            value="<?php echo htmlspecialchars($patientIdValue, ENT_QUOTES); ?>">
+                                        <input type="hidden" name="date_from"
+                                            value="<?php echo htmlspecialchars($dateFromValue, ENT_QUOTES); ?>">
+                                        <input type="hidden" name="date_to"
+                                            value="<?php echo htmlspecialchars($dateToValue, ENT_QUOTES); ?>">
+                                        <input type="hidden" name="sort"
+                                            value="<?php echo htmlspecialchars($sort, ENT_QUOTES); ?>">
+                                        <input type="hidden" name="page" value="1">
+                                        <?php if (!empty($forceRemote)): ?>
+                                            <input type="hidden" name="force_remote" value="1">
+                                            <?php
+                                        endif; ?>
+                                        <?php foreach ($selectedModalities as $m): ?>
+                                            <input type="hidden" name="modalities[]"
+                                                value="<?php echo htmlspecialchars($m, ENT_QUOTES); ?>">
+                                            <?php
+                                        endforeach; ?>
+                                        <div class="btn-group">
+                                            <input type="hidden" id="per_page_input" name="per_page"
+                                                value="<?php echo $perPage; ?>">
+                                            <button type="button"
+                                                class="btn btn-sm btn-outline-secondary dropdown-toggle per-page-btn"
+                                                data-bs-toggle="dropdown" aria-expanded="false">
+                                                <i class="bi bi-list-ul"></i>
+                                                <span class="visually-hidden">Filas</span>
+                                                <span class="fw-bold ms-1 per-page-label">
+                                                    <?php echo $perPage; ?>
+                                                </span>
+                                            </button>
+                                            <ul class="dropdown-menu dropdown-menu-end">
+                                                <li><button class="dropdown-item per-page-option"
+                                                        data-value="10">10</button></li>
+                                                <li><button class="dropdown-item per-page-option"
+                                                        data-value="25">25</button></li>
+                                                <li><button class="dropdown-item per-page-option"
+                                                        data-value="50">50</button></li>
+                                                <li><button class="dropdown-item per-page-option"
+                                                        data-value="100">100</button></li>
+                                            </ul>
+                                        </div>
+                                    </form>
+                                </div>
+                            </div>
+
+                            <div class="results-inner">
+                                <?php if (isset($_GET['ajax'])) {
+                                    ob_end_clean();
+                                    ob_start();
+                                } ?>
+                                <?php if (!empty($studies)): ?>
+                                    <div class="table-responsive">
+                                        <table class="table table-sm table-striped table-hover">
+                                            <thead>
+                                                <tr>
+                                                    <th><a href="?sort=date&page=1&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?>"
+                                                            style="color: inherit; text-decoration: none;">Fecha
+                                                            <?php if ($sort === 'date')
+                                                                echo ($_SESSION['sort_order'] === 'asc' ? ' ↑' : ' ↓'); ?>
+                                                        </a>
+                                                    </th>
+                                                    <th>ID Paciente</th>
+                                                    <th><a href="?sort=name&page=1&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?>"
+                                                            style="color: inherit; text-decoration: none;">Nombre
+                                                            <?php if ($sort === 'name')
+                                                                echo ($_SESSION['sort_order'] === 'asc' ? ' ↑' : ' ↓'); ?>
+                                                        </a>
+                                                    </th>
+                                                    <th>Hora</th>
+                                                    <th>Modalidad(es)</th>
+                                                    <th>Descripción</th>
+                                                    <th>Acciones</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                <?php foreach ($studies as $s): ?>
+                                                    <?php
+                                                    $tags = array_merge($s['MainDicomTags'] ?? [], $s['PatientMainDicomTags'] ?? []);
+                                                    $studyUid = $tags['StudyInstanceUID'] ?? null;
+
+                                                    // Obtener datos completos del estudio desde Orthanc para asegurar PatientID y PatientName
+                                                    if ($studyUid) {
+                                                        $fullTags = getOrthancStudyFullData($studyUid);
+                                                        if ($fullTags && is_array($fullTags)) {
+                                                            // Enriquecer tags con datos completos de Orthanc
+                                                            $tags = array_merge($tags, $fullTags['MainDicomTags'] ?? [], $fullTags['PatientMainDicomTags'] ?? $fullTags);
+                                                        }
+                                                    }
+
+                                                    $rawDate = pickTag($tags, ['StudyDate', '0008,0020']);
+                                                    $rawTime = pickTag($tags, ['StudyTime', 'SeriesTime', 'AcquisitionTime', '0008,0030']) ?: ($s['StudyTime'] ?? '');
+                                                    $desc = pickTag($tags, ['StudyDescription', 'SeriesDescription', 'ProtocolName']);
+                                                    // Obtener PatientID y PatientName por separado (sin fallback cruzado)
+                                                    // Si la búsqueda fue por PatientID, usar ese valor como ID mostrado
+                                                    $patientId = $patientIdValue !== '' ? $patientIdValue : pickTag($tags, ['PatientID', '0010,0020']);
+                                                    // Si tenemos $globalPatientName desde la query Patient, usarlo como nombre
+                                                    $patientName = !empty($globalPatientName) ? $globalPatientName : pickTag($tags, ['PatientName', '0010,0010', 'Patient']);
+                                                    $patientName = $patientName !== '' ? str_replace('^', ' ', $patientName) : '';
+                                                    $patientName = preg_replace('/^PatientName\s+String\s+/i', '', $patientName);
+                                                    // Si no obtuvimos nombre en la respuesta inicial, intentar obtenerlo desde los tags completos del estudio en Orthanc
+                                                    if (($patientName === '' || strtolower($patientName) === 'sin nombre') && $studyUid) {
+                                                        $full = getOrthancStudyFullData($studyUid);
+                                                        if (!empty($full) && isset($full['PatientMainDicomTags']['PatientName']) && $full['PatientMainDicomTags']['PatientName'] !== '') {
+                                                            $tempName = $full['PatientMainDicomTags']['PatientName'];
+                                                            if (is_array($tempName)) {
+                                                                if (isset($tempName['Alphabetic'])) {
+                                                                    $tempName = (string) $tempName['Alphabetic'];
+                                                                } else {
+                                                                    $tempName = implode(' ', array_filter(array_map('strval', $tempName)));
+                                                                }
+                                                            } else {
+                                                                $tempName = (string) $tempName;
+                                                            }
+                                                            $patientName = str_replace('^', ' ', $tempName);
+                                                            $patientName = preg_replace('/^PatientName\s+String\s+/i', '', $patientName);
+                                                        }
+                                                    }
+                                                    if (empty($tags['ModalitiesInStudy']) && !empty($s['_local']) && $studyUid) {
+                                                        $full = getOrthancStudyFullData($studyUid);
+                                                        if ($full && isset($full['MainDicomTags']['ModalitiesInStudy'])) {
+                                                            $tags['ModalitiesInStudy'] = $full['MainDicomTags']['ModalitiesInStudy'];
+                                                        }
+                                                    }
+                                                    if ($patientName === '') {
+                                                        $patientName = 'Sin nombre';
+                                                    }
+                                                    $dateText = formatDicomDate($rawDate);
+                                                    $timeText = formatDicomTime($rawTime);
+
+                                                    $mods = '';
+                                                    if (!empty($tags['ModalitiesInStudy']) && is_array($tags['ModalitiesInStudy'])) {
+                                                        $mods = implode(',', $tags['ModalitiesInStudy']);
+                                                    } else {
+                                                        $modFromTags = $tags['Modality'] ?? '';
+                                                        $modFromStudy = $s['Modality'] ?? '';
+                                                        if (!empty($modFromTags)) {
+                                                            $mods = $modFromTags;
+                                                        } elseif (!empty($modFromStudy)) {
+                                                            $mods = $modFromStudy;
+                                                        } elseif (isset($s['00080060']['Value'][0])) {
+                                                            $mods = $s['00080060']['Value'][0];
+                                                        }
+                                                    }
+
+                                                    // Mapear códigos DICOM a abreviaturas
+                                                    $modList = explode(',', $mods);
+                                                    $mappedMods = array_map(function ($m) use ($modalityMap) {
+                                                        $trimmed = trim($m);
+                                                        return $modalityMap[$trimmed] ?? $trimmed;
+                                                    }, $modList);
+                                                    $mods = implode(',', $mappedMods);
+
+                                                    if (!$mods && $studyUid) {
+                                                        // Tratar de recuperar las modalidades preguntando directamente a Orthanc por el nivel "Serie"
+                                                        try {
+                                                            $series = callOrthanc('GET', '/studies/' . urlencode($studyUid) . '/series');
+                                                            if (is_array($series)) {
+                                                                $modalities = [];
+                                                                foreach ($series as $ser) {
+                                                                    if (isset($ser['MainDicomTags']['Modality'])) {
+                                                                        $modalities[] = $ser['MainDicomTags']['Modality'];
+                                                                    }
+                                                                }
+                                                                $modalities = array_unique($modalities);
+                                                                if (!empty($modalities)) {
+                                                                    $mods = implode(',', $modalities);
+                                                                    $modList = explode(',', $mods);
+                                                                    $mappedMods = array_map(function ($m) use ($modalityMap) {
+                                                                        $trimmed = trim($m);
+                                                                        return $modalityMap[$trimmed] ?? $trimmed;
+                                                                    }, $modList);
+                                                                    $mods = implode(',', $mappedMods);
+                                                                }
+                                                            }
+                                                        } catch (Exception $e) {
+                                                            // Ignorar el error si el estudio fue borrado o no responde
+                                                        }
+                                                    }
+
+                                                    if (!$mods) {
+                                                        // Inferir modalidad desde la descripción
+                                                        $inferred = getInferredModality($desc);
+                                                        $mods = $inferred ?: 'N/D';
+                                                    }
+
+                                                    $studyUid = $tags['StudyInstanceUID'] ?? null;
+                                                    ?>
+                                                    <tr>
+                                                        <td data-label="Fecha">
+                                                            <?php echo htmlspecialchars($dateText ?: 'N/D', ENT_QUOTES); ?>
+                                                        </td>
+                                                        <td data-label="ID Paciente">
+                                                            <?php echo htmlspecialchars($patientId ?: 'N/D', ENT_QUOTES); ?>
+                                                        </td>
+                                                        <td data-label="Nombre">
+                                                            <?php echo htmlspecialchars($patientName ?: 'N/D', ENT_QUOTES); ?>
+                                                        </td>
+                                                        <td data-label="Hora">
+                                                            <?php echo htmlspecialchars($timeText ?: 'N/D', ENT_QUOTES); ?>
+                                                        </td>
+                                                        <td data-label="Modalidad(es)">
+                                                            <?php if ($mods): ?>
+                                                                <div class="d-flex flex-wrap gap-1">
+                                                                    <?php $modArray = explode(',', $mods); ?>
+                                                                    <?php foreach ($modArray as $m):
+                                                                        $m = trim($m); ?>
+                                                                        <span
+                                                                            class="modality-badge mod-<?php echo htmlspecialchars($m, ENT_QUOTES); ?>">
+                                                                            <?php echo htmlspecialchars($m, ENT_QUOTES); ?>
+                                                                        </span>
+                                                                        <?php
+                                                                    endforeach; ?>
+                                                                </div>
+                                                                <?php
+                                                            else: ?>
+                                                                <span class="modality-badge">N/D</span>
+                                                                <?php
+                                                            endif; ?>
+                                                        </td>
+                                                        <td>
+                                                            <?php echo htmlspecialchars($desc, ENT_QUOTES); ?>
+                                                        </td>
+                                                        <td data-label="Acciones">
+                                                            <?php if ($studyUid): ?>
+                                                                <?php if (!empty($s['_local'])): ?>
+                                                                    <a href="?action=view&study_uid=<?php echo urlencode($studyUid); ?>"
+                                                                        target="_blank" rel="noopener noreferrer"
+                                                                        class="btn btn-secondary btn-sm btn-visualize"
+                                                                        data-bs-toggle="tooltip" title="Visualizar estudio">
+                                                                        <i class="bi bi-eye"></i> Visualizar
+                                                                    </a>
+                                                                    <a href="?action=download&study_uid=<?php echo urlencode($studyUid); ?>&download_now=1"
+                                                                        class="btn btn-outline-success btn-sm ms-1 btn-download"
+                                                                        title="Descargar imágenes JPG">
+                                                                        <i class="bi bi-download"></i> Descargar
+                                                                    </a>
+                                                                    <?php
+                                                                else: ?>
+                                                                    <a href="?action=view&study_uid=<?php echo urlencode($studyUid); ?>&query_id=<?php echo urlencode($s['_remote']['queryId'] ?? ($_SESSION['last_query']['id'] ?? '')); ?>&answer_idx=<?php echo urlencode($s['_remote']['answerIdx'] ?? ''); ?>"
+                                                                        target="_blank" rel="noopener noreferrer"
+                                                                        class="btn btn-secondary btn-sm btn-visualize"
+                                                                        data-bs-toggle="tooltip"
+                                                                        title="Visualizar estudio (traer desde Canvas)">
+                                                                        <i class="bi bi-eye"></i> Visualizar
+                                                                    </a>
+                                                                    <a href="?action=download&study_uid=<?php echo urlencode($studyUid); ?>&query_id=<?php echo urlencode($s['_remote']['queryId'] ?? ($_SESSION['last_query']['id'] ?? '')); ?>&answer_idx=<?php echo urlencode($s['_remote']['answerIdx'] ?? ''); ?>"
+                                                                        class="btn btn-outline-success btn-sm ms-1 btn-download"
+                                                                        title="Descargar imágenes JPG">
+                                                                        <i class="bi bi-download"></i> Descargar
+                                                                    </a>
+                                                                    <div class="small text-muted mt-1">Si el estudio no está en Orthanc se
+                                                                        iniciará su traslado y se esperará antes de descargar.</div>
+                                                                    <?php
+                                                                endif; ?>
+                                                                <?php
+                                                            else: ?>
+                                                                <em>Sin UID de estudio</em>
+                                                                <?php
+                                                            endif; ?>
+                                                        </td>
+                                                    </tr>
+                                                    <?php
+                                                endforeach; ?>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                                <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;">
+                                    <div class="hint">
+                                        <?php
+                                        $showFrom = ($page - 1) * $perPage + 1;
+                                        $showTo = min($totalResults, $page * $perPage);
+                                        if ($totalResults === 0) {
+                                            echo 'Mostrando 0 resultados.';
+                                        } else {
+                                            echo 'Mostrando ' . $showFrom . ' - ' . $showTo . ' de ' . $totalResults . ' estudios.';
+                                        }
+                                        ?>
+                                    </div>
+                                    <div>
+                                        <?php if ($page > 1): ?>
+                                            <a href="?page=<?php echo $page - 1; ?>&sort=<?php echo $sort; ?>&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?>"
+                                                class="btn btn-outline-secondary rounded-pill btn-sm">◀ Anterior</a>
+                                            <?php
+                                        endif; ?>
+                                        <?php if ($page < $totalPages): ?>
+                                            <a href="?page=<?php echo $page + 1; ?>&sort=<?php echo $sort; ?>&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?>"
+                                                class="btn btn-outline-secondary rounded-pill btn-sm">Siguiente ▶</a>
+                                            <?php
+                                        endif; ?>
+                                    </div>
+                                </div>
+                                <?php
+                                else: ?>
+                                <p class="hint">No se encontraron estudios que coincidan con los criterios de búsqueda.</p>
+                                <?php
+                                endif; ?>
+                            <?php
+                            if (isset($_GET['ajax'])) {
+                                $html = ob_get_clean();
+                                header('Content-Type: application/json');
+                                echo json_encode([
+                                    'html' => $html,
+                                    'status' => $status ?? null,
+                                    'message' => $message ?? ''
+                                ]);
+                                exit;
+                            }
+                            ?>
+                        </div>
                     </div>
                 </div>
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;">
-                    <div class="hint">
-                        <?php
-                        $showFrom = ($page - 1) * $perPage + 1;
-                        $showTo = min($totalResults, $page * $perPage);
-                        if ($totalResults === 0) {
-                            echo 'Mostrando 0 resultados.';
-                        } else {
-                            echo 'Mostrando ' . $showFrom . ' - ' . $showTo . ' de ' . $totalResults . ' estudios.';
+            </div>
+
+            <?php
+            endif; // fin rama logueado / no logueado ?>
+    </div>
+
+
+
+    <script>
+        (function () {
+            var base = '<?php echo rtrim($OHIF_BASE_URL, "/"); ?>';
+            var path = '<?php echo rtrim($OHIF_VIEWER_PATH, "/"); ?>';
+            var ohifUrlBase = base + path;
+
+            function openOhif(studyUid) {
+                if (!studyUid) return;
+                var url = ohifUrlBase + encodeURIComponent(studyUid);
+                window.open(url, '_blank');
+            }
+
+        })();
+    </script>
+
+    <!-- Modality filter toggle -->
+
+    <script>
+        // Load Flatpickr (CDN) and Spanish locale before using it
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+    <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/es.js"></script>
+    <!-- inline initialization removed; handled by /buscador/assets/js/remoto1.js -->
+
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="/buscador/assets/js/remoto1.js"></script>
+
+    <!-- Spinner overlay for actions -->
+    <div id="action-overlay"
+        style="display:none;position:fixed;inset:0;background:rgba(255,255,255,0.7);z-index:2000;align-items:center;justify-content:center;">
+        <div class="text-center">
+            <div class="spinner-border text-primary" role="status" style="width:3rem;height:3rem;"></div>
+            <div class="mt-2">Procesando...</div>
+        </div>
+    </div>
+
+    <script>
+        var hasGD = <?php echo ($hasGD ? 'true' : 'false'); ?>;
+        var hasZipArchive = <?php echo ($hasZipArchive ? 'true' : 'false'); ?>;
+        var tmpWritable = <?php echo ($tmpWritable ? 'true' : 'false'); ?>;
+        var downloadSupportMessage = <?php echo json_encode($downloadSupportMessage); ?>;
+        window.bindTableActions = function () {
+            // Descargar button logic
+            document.querySelectorAll('.btn-download').forEach(function (el) {
+                // Remove existing listener if any to avoid duplicates
+                el.replaceWith(el.cloneNode(true));
+            });
+            document.querySelectorAll('.btn-download').forEach(function (el) {
+                el.addEventListener('click', function (e) {
+                    e.preventDefault();
+                    var href = el.getAttribute('href') || el.dataset.href || null;
+                    if (!tmpWritable) {
+                        alert('No es posible preparar la descarga en el servidor. ' + downloadSupportMessage + '\nContacta al administrador para habilitar el directorio temporal.');
+                        return;
+                    }
+
+                    var overlay = document.getElementById('action-overlay');
+                    if (overlay) {
+                        overlay.innerHTML = '<div class="text-center"><div class="spinner-border text-primary" role="status" style="width:3rem;height:3rem;"></div><div class="mt-3 fw-bold text-dark fs-5">Preparando archivo ZIP...</div><div class="mt-2 text-dark">Dependiendo del tamaño de las imágenes, esto tardará un momento.<br>Por favor sigue operando normalmente.</div></div>';
+                        overlay.style.display = 'flex';
+                        setTimeout(function () {
+                            overlay.style.display = 'none';
+                        }, 12000); 
+                    }
+
+                    // --- [MODIFICACIÓN] Descarga en Fondo (Iframe Oculto) ---
+                    // Al inyectar el URL en un iframe, la página de espera navega y compila en 
+                    // segundo plano sin sacar al usuario del Dashboard principal.
+                    if (href) {
+                        var iframe = document.getElementById('hidden-download-frame');
+                        if (!iframe) {
+                            iframe = document.createElement('iframe');
+                            iframe.id = 'hidden-download-frame';
+                            iframe.style.display = 'none';
+                            document.body.appendChild(iframe);
                         }
-                        ?>
-                    </div>
-                    <div>
-                        <?php if ($page > 1): ?>
-                            <a href="?page=<?php echo $page - 1; ?>&sort=<?php echo $sort; ?>&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?>" class="btn btn-outline-secondary rounded-pill btn-sm">◀ Anterior</a>
-                        <?php endif; ?>
-                        <?php if ($page < $totalPages): ?>
-                            <a href="?page=<?php echo $page + 1; ?>&sort=<?php echo $sort; ?>&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?>" class="btn btn-outline-secondary rounded-pill btn-sm">Siguiente ▶</a>
-                        <?php endif; ?>
-                    </div>
+                        iframe.src = href;
+                    }
+                });
+            });
+
+            // Tooltips
+            var tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
+            tooltipTriggerList.forEach(function (el) { new bootstrap.Tooltip(el); });
+
+            // Overlay show on Visualizar click
+            document.querySelectorAll('.btn-visualize').forEach(function (btn) {
+                btn.replaceWith(btn.cloneNode(true));
+            });
+            document.querySelectorAll('.btn-visualize').forEach(function (btn) {
+                btn.addEventListener('click', function () {
+                    var overlay = document.getElementById('action-overlay');
+                    if (overlay) overlay.style.display = 'flex';
+                    btn.classList.add('disabled');
+                    setTimeout(function () { if (overlay) overlay.style.display = 'none'; btn.classList.remove('disabled'); }, 1500);
+                });
+            });
+        };
+
+        document.addEventListener('DOMContentLoaded', function () {
+            window.bindTableActions();
+        });
+    </script>
+
+    <!-- Modal: full modalities list (moved inside body so JS can find it) -->
+    <div class="modal fade" id="modal-modalities-full" tabindex="-1" aria-labelledby="modalModalitiesFullLabel"
+        aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="modalModalitiesFullLabel">Modalidades disponibles</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Cerrar"></button>
                 </div>
-            <?php else: ?>
-                <p class="hint">No se encontraron estudios que coincidan con los criterios de búsqueda.</p>
-            <?php endif; ?>
-            </div>
+                <div class="modal-body">
+                    <!-- populated dynamically -->
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
                 </div>
             </div>
         </div>
-
-    <?php endif; // fin rama logueado / no logueado ?>
-</div>
-
-
-
-<!--
-  =============================================================================
-  SECCIÓN 12: MANEJADORES DE INTERACCIÓN CLIENTE Y AJAX (JAVASCRIPT)
-  =============================================================================
-  Scripting del lado del cliente para abrir el visualizador OHIF, gestionar
-  eventos de la interfaz y manejar alternativas de descarga.
--->
-<script>
-(function () {
-    var base = '<?php echo rtrim($OHIF_BASE_URL, "/"); ?>';
-    var path = '<?php echo rtrim($OHIF_VIEWER_PATH, "/"); ?>';
-    var ohifUrlBase = base + path;
-
-    function openOhif(studyUid) {
-        if (!studyUid) return;
-        var url = ohifUrlBase + encodeURIComponent(studyUid);
-        window.open(url, '_blank');
-    }
-
-    // (Date clearing moved to DOMContentLoaded so it can interact with the enhanced pickers)
-
-    // No longer needed since all are forms now
-})();
-</script>
-
-<!-- Modality filter toggle -->
-
-<script>
-// Load Flatpickr (CDN) and Spanish locale before using it
-</script>
-<script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
-<script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/es.js"></script>
-<!-- inline initialization removed; handled by /buscador/assets/js/remoto1.js -->
-
-<!-- Bootstrap JS -->
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-<script src="/buscador/assets/js/remoto1.js"></script>
-<script>
-var hasGD = <?php echo ($hasGD ? 'true' : 'false'); ?>;
-var hasZipArchive = <?php echo ($hasZipArchive ? 'true' : 'false'); ?>;
-var tmpWritable = <?php echo ($tmpWritable ? 'true' : 'false'); ?>;
-var downloadSupportMessage = <?php echo json_encode($downloadSupportMessage); ?>;
-document.addEventListener('DOMContentLoaded', function(){
-    document.querySelectorAll('.btn-download').forEach(function(el){
-        el.addEventListener('click', function(e){
-            var href = el.getAttribute('href') || el.dataset.href || null;
-            if (!tmpWritable) {
-                e.preventDefault();
-                alert('No es posible preparar la descarga en el servidor. ' + downloadSupportMessage + '\nContacta al administrador para habilitar el directorio temporal.');
-                return;
-            }
-            // If missing GD or ZipArchive, warn user but allow fallback
-            if (!hasGD || !hasZipArchive) {
-                var warn = 'Aviso: el servidor no tiene ' + (hasGD? '' : 'GD (convertir a JPG) ') + (hasZipArchive? '' : 'ZipArchive (uso de fallback) ');
-                warn = warn.trim() + '.\nSe intentará usar métodos alternativos para generar la descarga. ¿Deseas continuar?';
-                if (!confirm(warn)) {
-                    e.preventDefault();
-                    return;
-                }
-                // allow default navigation to proceed (some browsers need explicit navigation)
-                if (href) {
-                    // follow href explicitly to avoid anchor default prevented by other handlers
-                    window.location = href;
-                    e.preventDefault();
-                }
-            }
-            // otherwise allow normal click (will navigate to the download URL)
-        });
-    });
-});
-</script>
-<!-- Spinner overlay for actions -->
-<div id="action-overlay" style="display:none;position:fixed;inset:0;background:rgba(255,255,255,0.7);z-index:2000;align-items:center;justify-content:center;">
-    <div class="text-center">
-        <div class="spinner-border text-primary" role="status" style="width:3rem;height:3rem;"></div>
-        <div class="mt-2">Procesando...</div>
     </div>
-</div>
-<script>
-document.addEventListener('DOMContentLoaded', function() {
-    // Initialize Bootstrap tooltips
-    var tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
-    tooltipTriggerList.forEach(function (el) { new bootstrap.Tooltip(el); });
-
-    // Overlay show on Visualizar click (temporary indicator; non-blocking)
-    document.querySelectorAll('.btn-visualize').forEach(function(btn){
-        btn.addEventListener('click', function(){
-            var overlay = document.getElementById('action-overlay');
-            if (overlay) overlay.style.display = 'flex';
-            btn.classList.add('disabled');
-            setTimeout(function(){ if (overlay) overlay.style.display = 'none'; btn.classList.remove('disabled'); }, 1500);
-        });
-    });
-
-    // Modalities dropdown handled in external JS
-});
-</script>
-
-<!-- Modal: full modalities list (moved inside body so JS can find it) -->
-<div class="modal fade" id="modal-modalities-full" tabindex="-1" aria-labelledby="modalModalitiesFullLabel" aria-hidden="true">
-    <div class="modal-dialog modal-dialog-centered">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h5 class="modal-title" id="modalModalitiesFullLabel">Modalidades disponibles</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Cerrar"></button>
-            </div>
-            <div class="modal-body">
-                <!-- populated dynamically -->
-            </div>
-            <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
-            </div>
-        </div>
-    </div>
-</div>
 
     </div>
     <!-- Premium Features Addons -->
@@ -2809,51 +3398,155 @@ document.addEventListener('DOMContentLoaded', function() {
 
     <div class="toast-container position-fixed top-0 end-0 p-4" style="z-index: 10500;">
         <?php if (isset($status) && ($status === 'error' || $status === 'ok')): ?>
-        <div id="systemToast" class="toast align-items-center text-white bg-<?php echo $status === 'ok' ? 'success' : 'danger'; ?> border-0" role="alert" aria-live="assertive" aria-atomic="true">
-            <div class="d-flex">
-                <div class="toast-body" style="font-family: 'Outfit', sans-serif; font-size: 1.05rem;">
-                    <?php echo $status === 'ok' ? '✅' : '⚠️'; ?> <?php echo htmlspecialchars($message, ENT_QUOTES); ?>
+            <div id="systemToast"
+                class="toast align-items-center text-white bg-<?php echo $status === 'ok' ? 'success' : 'danger'; ?> border-0"
+                role="alert" aria-live="assertive" aria-atomic="true">
+                <div class="d-flex">
+                    <div class="toast-body" style="font-family: 'Outfit', sans-serif; font-size: 1.05rem;">
+                        <?php echo $status === 'ok' ? '✅' : '⚠️'; ?>
+                        <?php echo htmlspecialchars($message, ENT_QUOTES); ?>
+                    </div>
+                    <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"
+                        aria-label="Cerrar"></button>
                 </div>
-                <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Cerrar"></button>
             </div>
-        </div>
-        <?php endif; ?>
+            <?php
+        endif; ?>
     </div>
 
     <script>
-    // Theme Toggle Logic
-    const themeBtn = document.getElementById('theme-toggle');
-    const currentTheme = localStorage.getItem('theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-    if (currentTheme === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+        /**
+         * ====================================================================
+         * SECCIÓN 12: MANEJADORES DE INTERACCIÓN CLIENTE (JAVASCRIPT)
+         * ====================================================================
+         * Códigos Javascript del lado del navegador del usuario para:
+         * 1. Manejo dinámico del tema Claro y Oscuro guardando en LocalStorage.
+         * 2. Evitar que la página se resfresque completamente mediante uso de fetch() 
+         *    para mandar la tabla de datos y botones de forma ininterrumpida (AJAX).
+         */
 
-    if (themeBtn) {
-        themeBtn.addEventListener('click', () => {
-            let theme = document.documentElement.getAttribute('data-theme');
-            if (theme === 'dark') {
-                document.documentElement.removeAttribute('data-theme');
-                localStorage.setItem('theme', 'light');
-            } else {
-                document.documentElement.setAttribute('data-theme', 'dark');
-                localStorage.setItem('theme', 'dark');
+        // Theme Toggle Logic
+        const themeBtn = document.getElementById('theme-toggle');
+        const currentTheme = localStorage.getItem('theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+        if (currentTheme === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+
+        if (themeBtn) {
+            themeBtn.addEventListener('click', () => {
+                let theme = document.documentElement.getAttribute('data-theme');
+                if (theme === 'dark') {
+                    document.documentElement.removeAttribute('data-theme');
+                    localStorage.setItem('theme', 'light');
+                } else {
+                    document.documentElement.setAttribute('data-theme', 'dark');
+                    localStorage.setItem('theme', 'dark');
+                }
+            });
+        }
+
+        // Spinner Logic
+        function showSpinner() {
+            document.getElementById('loading-overlay').classList.add('active');
+        }
+
+        // Toast Initialization
+        document.addEventListener('DOMContentLoaded', () => {
+            const toastElList = [].slice.call(document.querySelectorAll('.toast'));
+            const toastList = toastElList.map(function (toastEl) {
+                return new bootstrap.Toast(toastEl, { delay: 5000 });
+            });
+            toastList.forEach(toast => toast.show());
+        });
+        // AJAX Search Logic
+        document.addEventListener('DOMContentLoaded', () => {
+            const resultsContainer = document.querySelector('.results-inner');
+            const searchForm = document.querySelector('form[method="get"]:not(#per-page-form)');
+            const perPageForm = document.getElementById('per-page-form');
+            const loadingOverlay = document.getElementById('loading-overlay');
+            const toastContainer = document.querySelector('.toast-container');
+
+            function showSystemToast(status, message) {
+                const toastHtml = `
+            <div class="toast align-items-center text-white bg-${status === 'ok' ? 'success' : 'danger'} border-0" role="alert" aria-live="assertive" aria-atomic="true">
+                <div class="d-flex">
+                    <div class="toast-body" style="font-family: 'Outfit', sans-serif; font-size: 1.05rem;">
+                        ${status === 'ok' ? '✅' : '⚠️'} ${message}
+                    </div>
+                    <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Cerrar"></button>
+                </div>
+            </div>`;
+                if (toastContainer) {
+                    toastContainer.insertAdjacentHTML('beforeend', toastHtml);
+                    const newToastEl = toastContainer.lastElementChild;
+                    new bootstrap.Toast(newToastEl, { delay: 5000 }).show();
+                }
+            }
+
+            function performAjaxSearch(urlStr) {
+                if (loadingOverlay) loadingOverlay.classList.add('active');
+                fetch(urlStr)
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.html !== undefined) {
+                            resultsContainer.innerHTML = data.html;
+                        }
+                        if (data.status && data.message) {
+                            showSystemToast(data.status, data.message);
+                        }
+                        if (loadingOverlay) loadingOverlay.classList.remove('active');
+
+                        // Re-bind table actions seamlessly
+                        if (typeof window.bindTableActions === 'function') {
+                            window.bindTableActions();
+                        }
+
+                        // Push state to update URL cleanly
+                        const cleanUrl = urlStr.replace(/&ajax=1/g, '').replace(/\?ajax=1&/, '?').replace(/\?ajax=1$/, '');
+                        window.history.pushState({}, '', cleanUrl);
+                    })
+                    .catch(err => {
+                        console.error('AJAX Error:', err);
+                        if (loadingOverlay) loadingOverlay.classList.remove('active');
+                        showSystemToast('error', 'Ocurrió un error de conexión al buscar los estudios.');
+                    });
+            }
+
+            // Intercept Main Search Form
+            if (searchForm) {
+                searchForm.addEventListener('submit', function (e) {
+                    e.preventDefault();
+                    const url = new URL(window.location.href);
+                    const formData = new FormData(this);
+                    url.search = new URLSearchParams(formData).toString() + '&ajax=1';
+                    performAjaxSearch(url.toString());
+                });
+            }
+
+            // Override Per-Page Form submission to prevent native form post
+            if (perPageForm) {
+                perPageForm.submit = function () {
+                    const url = new URL(window.location.href);
+                    const formData = new FormData(perPageForm);
+                    url.search = new URLSearchParams(formData).toString() + '&ajax=1';
+                    performAjaxSearch(url.toString());
+                };
+            }
+
+            // Intercept pagination and sorting links inside the results
+            if (resultsContainer) {
+                resultsContainer.addEventListener('click', function (e) {
+                    const link = e.target.closest('a[href*="sort="], a[href*="page="]');
+                    if (link) {
+                        e.preventDefault();
+                        const url = link.href + (link.href.includes('?') ? '&' : '?') + 'ajax=1';
+                        performAjaxSearch(url);
+                    }
+                });
             }
         });
-    }
 
-    // Spinner Logic
-    function showSpinner() {
-        document.getElementById('loading-overlay').classList.add('active');
-    }
-
-    // Toast Initialization
-    document.addEventListener('DOMContentLoaded', () => {
-        const toastElList = [].slice.call(document.querySelectorAll('.toast'));
-        const toastList = toastElList.map(function(toastEl) {
-            return new bootstrap.Toast(toastEl, { delay: 5000 });
-        });
-        toastList.forEach(toast => toast.show());
-    });
     </script>
 
-    </body>
-    </html>
-    <?php ob_end_flush(); ?>
+</body>
+
+</html>
+<?php ob_end_flush(); ?>

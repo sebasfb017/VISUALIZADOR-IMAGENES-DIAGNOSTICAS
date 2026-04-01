@@ -3302,23 +3302,34 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
             });
             document.querySelectorAll('.btn-download').forEach(function (el) {
                 el.addEventListener('click', function (e) {
+                    e.preventDefault();
                     var href = el.getAttribute('href') || el.dataset.href || null;
                     if (!tmpWritable) {
-                        e.preventDefault();
                         alert('No es posible preparar la descarga en el servidor. ' + downloadSupportMessage + '\nContacta al administrador para habilitar el directorio temporal.');
                         return;
                     }
-                    // La alerta de extensiones ausentes (GD, ZipArchive) fue removida
-                    // dado que el nuevo algoritmo backend realiza auto-fallback a binarios y compilación
-                    // nativa ZIP de manera invisible para el usuario sin requerir confirmación.
+
                     var overlay = document.getElementById('action-overlay');
                     if (overlay) {
-                        overlay.innerHTML = '<div class="text-center"><div class="spinner-border text-primary" role="status" style="width:3rem;height:3rem;"></div><div class="mt-3 fw-bold text-dark fs-5">Preparando archivo ZIP...</div><div class="mt-2 text-dark">Esto tardará un par de minutos dependiendo de la cantidad de imágenes.<br>Por favor espera pacientemente.</div></div>';
+                        overlay.innerHTML = '<div class="text-center"><div class="spinner-border text-primary" role="status" style="width:3rem;height:3rem;"></div><div class="mt-3 fw-bold text-dark fs-5">Preparando archivo ZIP...</div><div class="mt-2 text-dark">Dependiendo del tamaño de las imágenes, esto tardará un momento.<br>Por favor sigue operando normalmente.</div></div>';
                         overlay.style.display = 'flex';
                         setTimeout(function () {
                             overlay.style.display = 'none';
-                            overlay.innerHTML = '<div class="text-center"><div class="spinner-border text-primary" role="status" style="width:3rem;height:3rem;"></div><div class="mt-2">Procesando...</div></div>';
-                        }, 12000); // Se oculta porque la descarga no recarga la página
+                        }, 12000); 
+                    }
+
+                    // --- [MODIFICACIÓN] Descarga en Fondo (Iframe Oculto) ---
+                    // Al inyectar el URL en un iframe, la página de espera navega y compila en 
+                    // segundo plano sin sacar al usuario del Dashboard principal.
+                    if (href) {
+                        var iframe = document.getElementById('hidden-download-frame');
+                        if (!iframe) {
+                            iframe = document.createElement('iframe');
+                            iframe.id = 'hidden-download-frame';
+                            iframe.style.display = 'none';
+                            document.body.appendChild(iframe);
+                        }
+                        iframe.src = href;
                     }
                 });
             });
