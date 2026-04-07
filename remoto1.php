@@ -655,6 +655,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'login
  * SECCIÓN THUMBNAILS (Previsualización Hover en tiempo real)
  * ============================================================================
  */
+/*
 if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 'thumbnail') {
     $studyUid = trim($_GET['study_uid'] ?? '');
     if ($studyUid) {
@@ -685,7 +686,7 @@ if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 't
                     }
                 }
             }
-        } catch (Exception $e) { /* Silently fall back to empty png */
+        } catch (Exception $e) { // Silently fall back to empty png
         }
     }
     // Pixel transparente
@@ -693,6 +694,7 @@ if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 't
     echo base64_decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=');
     exit;
 }
+*/
 
 $isSharedAccess = false;
 if (isset($_GET['action']) && $_GET['action'] === 'view_shared') {
@@ -1668,7 +1670,15 @@ if (isset($_GET['action']) && $_GET['action'] === 'wait_download' && isset($_SES
     }
 
     ?>
-    <!DOCTYPE html>
+    <!-- 
+ ============================================================================ 
+ SECCIÓN 10: INTERFAZ GRÁFICA FRONT-END (HTML Y CSS) 
+ ============================================================================ 
+ Plantilla de maquetación principal. Emplea Bootstrap 5 para el esquema 
+ de respuesta (Responsive UI) y define un motor visual moderno (Dark mode, 
+ glassmorphism y transiciones suaves). No utiliza frameworks frontend como React/Vue. 
+-->
+<!DOCTYPE html>
     <html lang="es">
 
     <head>
@@ -1677,7 +1687,15 @@ if (isset($_GET['action']) && $_GET['action'] === 'wait_download' && isset($_SES
         <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
         <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
         <link rel="stylesheet" href="/buscador/assets/css/remoto1.css">
-        <script>
+        <!-- 
+    ============================================================================ 
+    SECCIÓN 11: LÓGICA JAVASCRIPT FRONT-END 
+    ============================================================================ 
+    Maneja interactividad del DOM: polling sincrónico para monitorear estados 
+    de descargas progresivas vía AJAX, generador de enlaces de compartición extendidos, 
+    miniaturas (thumbnails) bajo demanda y control de selección múltiple (Batch).
+    -->
+    <script>
             const currentTheme = localStorage.getItem('theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
             if (currentTheme === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
         </script>
@@ -1748,7 +1766,15 @@ if (isset($_GET['action']) && $_GET['action'] === 'wait_download' && isset($_SES
                 Si detectas errores, vuelve atrás y prueba la opción de <strong>Visualizar</strong> primero.
             </div>
         </div>
-        <script>
+        <!-- 
+    ============================================================================ 
+    SECCIÓN 11: LÓGICA JAVASCRIPT FRONT-END 
+    ============================================================================ 
+    Maneja interactividad del DOM: polling sincrónico para monitorear estados 
+    de descargas progresivas vía AJAX, generador de enlaces de compartición extendidos, 
+    miniaturas (thumbnails) bajo demanda y control de selección múltiple (Batch).
+    -->
+    <script>
             const study = <?php echo json_encode($studyUid); ?>;
             let stopped = false;
             document.getElementById('cancel').addEventListener('click', () => { stopped = true; window.location = '<?php echo $_SERVER['PHP_SELF']; ?>'; });
@@ -2021,6 +2047,14 @@ SECCIÓN 11: INTERFAZ GRÁFICA FRONT-END (HTML, CSS Y VISTAS)
 A partir de aquí, el archivo PHP implementa toda la interfaz de usuario, 
 diseño y experiencia (UX). Usa la directiva "Glassmorphism", soporte para
 temas claros/oscuros (Dark Mode) y grillas responsivas.
+-->
+<!-- 
+ ============================================================================ 
+ SECCIÓN 10: INTERFAZ GRÁFICA FRONT-END (HTML Y CSS) 
+ ============================================================================ 
+ Plantilla de maquetación principal. Emplea Bootstrap 5 para el esquema 
+ de respuesta (Responsive UI) y define un motor visual moderno (Dark mode, 
+ glassmorphism y transiciones suaves). No utiliza frameworks frontend como React/Vue. 
 -->
 <!DOCTYPE html>
 <html lang="es">
@@ -3395,6 +3429,14 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
 
 
 
+    <!-- 
+    ============================================================================ 
+    SECCIÓN 11: LÓGICA JAVASCRIPT FRONT-END 
+    ============================================================================ 
+    Maneja interactividad del DOM: polling sincrónico para monitorear estados 
+    de descargas progresivas vía AJAX, generador de enlaces de compartición extendidos, 
+    miniaturas (thumbnails) bajo demanda y control de selección múltiple (Batch).
+    -->
     <script>
         (function () {
             var base = '<?php echo rtrim($OHIF_BASE_URL, "/"); ?>';
@@ -3412,6 +3454,14 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
 
     <!-- Modality filter toggle -->
 
+    <!-- 
+    ============================================================================ 
+    SECCIÓN 11: LÓGICA JAVASCRIPT FRONT-END 
+    ============================================================================ 
+    Maneja interactividad del DOM: polling sincrónico para monitorear estados 
+    de descargas progresivas vía AJAX, generador de enlaces de compartición extendidos, 
+    miniaturas (thumbnails) bajo demanda y control de selección múltiple (Batch).
+    -->
     <script>
         // Load Flatpickr (CDN) and Spanish locale before using it
     </script>
@@ -3433,6 +3483,7 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
     </div>
 
     <!-- Thumbnail Overlay -->
+    <!--
     <div id="hover-thumbnail"
         style="display:none; position:fixed; z-index:9999; border-radius:12px; overflow:hidden; box-shadow: 0 15px 35px rgba(0,0,0,0.4); pointer-events:none; width: 220px; height: 220px; background: #111; transition: opacity 0.25s ease; opacity:0;">
         <div class="text-center w-100 h-100 d-flex align-items-center justify-content-center text-white"
@@ -3442,6 +3493,7 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
             style="width:100%; height:100%; object-fit:contain; position:relative; z-index:2;"
             onload="document.getElementById('hover-thumbnail-loading').style.display='none';" />
     </div>
+    -->
 
     <!-- Barra Inferior de Descarga Múltiple -->
     <div id="batch-download-bar" class="fixed-bottom shadow-lg p-3"
@@ -3459,6 +3511,14 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
         </div>
     </div>
 
+    <!-- 
+    ============================================================================ 
+    SECCIÓN 11: LÓGICA JAVASCRIPT FRONT-END 
+    ============================================================================ 
+    Maneja interactividad del DOM: polling sincrónico para monitorear estados 
+    de descargas progresivas vía AJAX, generador de enlaces de compartición extendidos, 
+    miniaturas (thumbnails) bajo demanda y control de selección múltiple (Batch).
+    -->
     <script>
         var hasGD = <?php echo ($hasGD ? 'true' : 'false'); ?>;
         var hasZipArchive = <?php echo ($hasZipArchive ? 'true' : 'false'); ?>;
@@ -3496,6 +3556,7 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
             };
 
             // Hover Thumbnails Logic
+            /*
             var thumbDiv = document.getElementById('hover-thumbnail');
             var thumbImg = document.getElementById('hover-thumbnail-img');
             var thumbLoad = document.getElementById('hover-thumbnail-loading');
@@ -3535,6 +3596,7 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                     }
                 });
             });
+            */
 
             // Batch selection logic
             var checkAll = document.getElementById('check-all-batch');
@@ -3673,6 +3735,14 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
         </div>
     </div>
 
+    <!-- 
+    ============================================================================ 
+    SECCIÓN 11: LÓGICA JAVASCRIPT FRONT-END 
+    ============================================================================ 
+    Maneja interactividad del DOM: polling sincrónico para monitorear estados 
+    de descargas progresivas vía AJAX, generador de enlaces de compartición extendidos, 
+    miniaturas (thumbnails) bajo demanda y control de selección múltiple (Batch).
+    -->
     <script>
         document.addEventListener('DOMContentLoaded', function () {
             var viewAllBtn = document.getElementById('modality-view-all');
@@ -3737,6 +3807,14 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
         endif; ?>
     </div>
 
+    <!-- 
+    ============================================================================ 
+    SECCIÓN 11: LÓGICA JAVASCRIPT FRONT-END 
+    ============================================================================ 
+    Maneja interactividad del DOM: polling sincrónico para monitorear estados 
+    de descargas progresivas vía AJAX, generador de enlaces de compartición extendidos, 
+    miniaturas (thumbnails) bajo demanda y control de selección múltiple (Batch).
+    -->
     <script>
         /**
          * ====================================================================
