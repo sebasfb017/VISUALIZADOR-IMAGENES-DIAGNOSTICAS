@@ -40,6 +40,9 @@ $USERS['invitado'] = 'invitado';
 // Límite de consultas simultáneas por usuario para mejorar concurrencia (aumentado para 15 usuarios)
 define('MAX_CONCURRENT_QUERIES', 5);
 
+// Clave secreta para la generación de enlaces efímeros temporales (Compartir a Pacientes)
+$SHARE_SECRET = 'vsd_auth_premium_2026';
+
 /**
  * ============================================================================
  * SECCIÓN 2: FUNCIONES AUXILIARES Y DE CONEXIÓN REST
@@ -113,6 +116,27 @@ function callOrthanc($method, $path, $body = null)
     }
     return $decoded;
 }
+
+// Llamada binaria a la API REST de Orthanc (Específicamente para descargar Thumbnails)
+function callOrthancBinary($method, $path)
+{
+    global $ORTHANC_URL;
+    $url = rtrim($ORTHANC_URL, '/') . $path;
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+    $headers = ['Accept: image/jpeg, image/png'];
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    if ($httpCode >= 200 && $httpCode < 300 && $response !== false) {
+        return $response;
+    }
+    return null;
+}
+
 
 // Construye el rango de fechas DICOM a partir de YYYY-MM-DD
 // DICOM: YYYYMMDD o YYYYMMDD-YYYYMMDD
@@ -626,7 +650,64 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'login
  * la orden de traerlo al equipo local (C-MOVE/retrieve) para luego mandarlo a 
  * ver nativamente en el visor OHIF de Orthanc.
  */
-if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 'view') {
+/**
+ * ============================================================================
+ * SECCIÓN THUMBNAILS (Previsualización Hover en tiempo real)
+ * ============================================================================
+ */
+if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 'thumbnail') {
+    $studyUid = trim($_GET['study_uid'] ?? '');
+    if ($studyUid) {
+        try {
+            $studies = callOrthanc('POST', '/tools/find', [
+                'Level' => 'Study',
+                'Query' => ['StudyInstanceUID' => $studyUid]
+            ]);
+            if (!empty($studies)) {
+                $studyId = $studies[0];
+                $series = callOrthanc('GET', "/studies/$studyId/series");
+                if (!empty($series)) {
+                    $seriesId = is_array($series[0]) ? ($series[0]['ID'] ?? null) : $series[0];
+                    if ($seriesId) {
+                        $instances = callOrthanc('GET', "/series/$seriesId/instances");
+                        if (!empty($instances)) {
+                            $instanceId = is_array($instances[0]) ? ($instances[0]['ID'] ?? null) : $instances[0];
+                            if ($instanceId) {
+                                $image = callOrthancBinary('GET', "/instances/$instanceId/preview");
+                                if ($image) {
+                                    header('Content-Type: image/jpeg');
+                                    header('Cache-Control: public, max-age=86400');
+                                    echo $image;
+                                    exit;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception $e) { /* Silently fall back to empty png */
+        }
+    }
+    // Pixel transparente
+    header('Content-Type: image/png');
+    echo base64_decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=');
+    exit;
+}
+
+$isSharedAccess = false;
+if (isset($_GET['action']) && $_GET['action'] === 'view_shared') {
+    $uid = trim($_GET['study_uid'] ?? '');
+    $exp = (int) ($_GET['exp'] ?? 0);
+    $sig = trim($_GET['sig'] ?? '');
+    $expectedSig = hash_hmac('sha256', $uid . '|' . $exp, $SHARE_SECRET);
+    if ($exp > time() && hash_equals($expectedSig, $sig)) {
+        $isSharedAccess = true;
+    } else {
+        die('Error de Acceso: El enlace ha caducado o no es válido.');
+    }
+}
+
+if ((isset($_SESSION['user']) || $isSharedAccess) && isset($_GET['action']) && ($_GET['action'] === 'view' || $_GET['action'] === 'view_shared')) {
     $studyUid = trim($_GET['study_uid'] ?? '');
 
     // --- [MODIFICACIÓN] 2. Validación Estricta RegEx de DICOM OID ---
@@ -2742,6 +2823,46 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                 border-bottom-color: rgba(255, 255, 255, 0.05);
             }
         }
+
+        /* --- Dark Mode para Componentes Premium Nuevos --- */
+        [data-theme="dark"] #offcanvas-modalities {
+            background: rgba(30, 41, 59, 0.95) !important;
+            border-left-color: rgba(255, 255, 255, 0.1) !important;
+        }
+
+        [data-theme="dark"] #offcanvas-modalities .text-dark,
+        [data-theme="dark"] #offcanvasModalitiesLabel {
+            color: #f1f5f9 !important;
+        }
+
+        [data-theme="dark"] #offcanvas-modalities li {
+            border-color: rgba(255, 255, 255, 0.1) !important;
+        }
+
+        [data-theme="dark"] #offcanvas-modalities .btn-close {
+            filter: invert(1) grayscale(100%) brightness(200%);
+        }
+
+        [data-theme="dark"] #batch-download-bar {
+            background: rgba(30, 41, 59, 0.95) !important;
+            border-top-color: rgba(255, 255, 255, 0.1) !important;
+        }
+
+        [data-theme="dark"] #batch-download-bar .text-dark {
+            color: #f1f5f9 !important;
+        }
+
+        [data-theme="dark"] #batch-download-bar .text-muted {
+            color: #94a3b8 !important;
+        }
+
+        [data-theme="dark"] .skeleton-box {
+            background-color: rgba(255, 255, 255, 0.08) !important;
+        }
+
+        [data-theme="dark"] .skeleton-box::after {
+            background-image: linear-gradient(90deg, rgba(255, 255, 255, 0) 0, rgba(255, 255, 255, 0.1) 20%, rgba(255, 255, 255, 0.2) 60%, rgba(255, 255, 255, 0)) !important;
+        }
     </style>
 </head>
 
@@ -2799,9 +2920,7 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
 
                 <nav class="navbar navbar-light bg-light mb-4 p-2 rounded">
                     <span class="navbar-text">Conectado como
-                        <strong>
-                            <?php echo htmlspecialchars($_SESSION['user'], ENT_QUOTES); ?>
-                        </strong></span>
+                        <strong><?php echo htmlspecialchars($_SESSION['user'], ENT_QUOTES); ?></strong></span>
                     <div class="d-flex align-items-center"><button type="button" id="theme-toggle"
                             class="btn btn-outline-secondary btn-sm me-2" title="Cambiar tema">🌙</button>
                         <a href="?logout=1" class="btn btn-outline-danger btn-sm"><i class="bi bi-box-arrow-right"></i>
@@ -2830,7 +2949,7 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                     </div>
                                 </div>
 
-                                <form method="get" onsubmit="showSpinner()">
+                                <form method="get">
 
                                     <div class="row g-2 align-items-end">
                                         <div class="col-12 col-md-6">
@@ -2904,9 +3023,7 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                                 $isSel = in_array($mod, $selectedModalities); ?>
                                                                 <button type="button"
                                                                     class="btn btn-sm btn-light w-100 text-start modality-item<?php echo $isSel ? ' selected' : ''; ?>"
-                                                                    data-value="<?php echo $safeMod; ?>">
-                                                                    <?php echo $safeMod; ?>
-                                                                </button>
+                                                                    data-value="<?php echo $safeMod; ?>"><?php echo $safeMod; ?></button>
                                                                 <?php if ($isSel): ?>
                                                                     <input type="hidden" name="modalities[]"
                                                                         value="<?php echo $safeMod; ?>">
@@ -2970,9 +3087,7 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                 data-bs-toggle="dropdown" aria-expanded="false">
                                                 <i class="bi bi-list-ul"></i>
                                                 <span class="visually-hidden">Filas</span>
-                                                <span class="fw-bold ms-1 per-page-label">
-                                                    <?php echo $perPage; ?>
-                                                </span>
+                                                <span class="fw-bold ms-1 per-page-label"><?php echo $perPage; ?></span>
                                             </button>
                                             <ul class="dropdown-menu dropdown-menu-end">
                                                 <li><button class="dropdown-item per-page-option"
@@ -2999,18 +3114,18 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                         <table class="table table-sm table-striped table-hover">
                                             <thead>
                                                 <tr>
+                                                    <th style="width:40px;">
+                                                        <input type="checkbox" class="form-check-input" id="check-all-batch"
+                                                            title="Seleccionar todos">
+                                                    </th>
                                                     <th><a href="?sort=date&page=1&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?>"
-                                                            style="color: inherit; text-decoration: none;">Fecha
-                                                            <?php if ($sort === 'date')
-                                                                echo ($_SESSION['sort_order'] === 'asc' ? ' ↑' : ' ↓'); ?>
-                                                        </a>
+                                                            style="color: inherit; text-decoration: none;">Fecha<?php if ($sort === 'date')
+                                                                echo ($_SESSION['sort_order'] === 'asc' ? ' ↑' : ' ↓'); ?></a>
                                                     </th>
                                                     <th>ID Paciente</th>
                                                     <th><a href="?sort=name&page=1&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?>"
-                                                            style="color: inherit; text-decoration: none;">Nombre
-                                                            <?php if ($sort === 'name')
-                                                                echo ($_SESSION['sort_order'] === 'asc' ? ' ↑' : ' ↓'); ?>
-                                                        </a>
+                                                            style="color: inherit; text-decoration: none;">Nombre<?php if ($sort === 'name')
+                                                                echo ($_SESSION['sort_order'] === 'asc' ? ' ↑' : ' ↓'); ?></a>
                                                     </th>
                                                     <th>Hora</th>
                                                     <th>Modalidad(es)</th>
@@ -3130,8 +3245,18 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                     }
 
                                                     $studyUid = $tags['StudyInstanceUID'] ?? null;
+                                                    $exp = time() + 86400; // 24 horas
+                                                    $sig = hash_hmac('sha256', $studyUid . '|' . $exp, $SHARE_SECRET);
+                                                    $shareUrl = "http://" . $_SERVER['HTTP_HOST'] . $_SERVER['PHP_SELF'] . "?action=view_shared&study_uid=" . urlencode($studyUid) . "&exp=$exp&sig=$sig";
                                                     ?>
-                                                    <tr>
+                                                    <tr class="study-row"
+                                                        data-uid="<?php echo htmlspecialchars($studyUid, ENT_QUOTES); ?>">
+                                                        <td class="text-center">
+                                                            <input type="checkbox" class="form-check-input batch-cb"
+                                                                value="<?php echo htmlspecialchars($studyUid, ENT_QUOTES); ?>"
+                                                                data-query="<?php echo htmlspecialchars($s['_remote']['queryId'] ?? ($_SESSION['last_query']['id'] ?? ''), ENT_QUOTES); ?>"
+                                                                data-answer="<?php echo htmlspecialchars($s['_remote']['answerIdx'] ?? '', ENT_QUOTES); ?>">
+                                                        </td>
                                                         <td data-label="Fecha">
                                                             <?php echo htmlspecialchars($dateText ?: 'N/D', ENT_QUOTES); ?>
                                                         </td>
@@ -3163,9 +3288,7 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                                 <?php
                                                             endif; ?>
                                                         </td>
-                                                        <td>
-                                                            <?php echo htmlspecialchars($desc, ENT_QUOTES); ?>
-                                                        </td>
+                                                        <td><?php echo htmlspecialchars($desc, ENT_QUOTES); ?></td>
                                                         <td data-label="Acciones">
                                                             <?php if ($studyUid): ?>
                                                                 <?php if (!empty($s['_local'])): ?>
@@ -3180,6 +3303,10 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                                         title="Descargar imágenes JPG">
                                                                         <i class="bi bi-download"></i> Descargar
                                                                     </a>
+                                                                    <button type="button" class="btn btn-outline-info btn-sm ms-1 btn-share"
+                                                                        onclick="copyShare(this, '<?php echo $shareUrl; ?>')"
+                                                                        data-bs-toggle="tooltip" title="Copiar enlace (24h)"><i
+                                                                            class="bi bi-share"></i></button>
                                                                     <?php
                                                                 else: ?>
                                                                     <a href="?action=view&study_uid=<?php echo urlencode($studyUid); ?>&query_id=<?php echo urlencode($s['_remote']['queryId'] ?? ($_SESSION['last_query']['id'] ?? '')); ?>&answer_idx=<?php echo urlencode($s['_remote']['answerIdx'] ?? ''); ?>"
@@ -3194,6 +3321,10 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                                         title="Descargar imágenes JPG">
                                                                         <i class="bi bi-download"></i> Descargar
                                                                     </a>
+                                                                    <button type="button" class="btn btn-outline-info btn-sm ms-1 btn-share"
+                                                                        onclick="copyShare(this, '<?php echo $shareUrl; ?>')"
+                                                                        data-bs-toggle="tooltip" title="Copiar enlace (24h)"><i
+                                                                            class="bi bi-share"></i></button>
                                                                     <div class="small text-muted mt-1">Si el estudio no está en Orthanc se
                                                                         iniciará su traslado y se esperará antes de descargar.</div>
                                                                     <?php
@@ -3294,10 +3425,37 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
 
     <!-- Spinner overlay for actions -->
     <div id="action-overlay"
-        style="display:none;position:fixed;inset:0;background:rgba(255,255,255,0.7);z-index:2000;align-items:center;justify-content:center;">
+        style="display:none;position:fixed;inset:0;background:rgba(255,255,255,0.7);z-index:2000;align-items:center;justify-content:center;backdrop-filter:blur(4px);">
         <div class="text-center">
             <div class="spinner-border text-primary" role="status" style="width:3rem;height:3rem;"></div>
-            <div class="mt-2">Procesando...</div>
+            <div class="mt-2 text-dark fw-bold">Procesando...</div>
+        </div>
+    </div>
+
+    <!-- Thumbnail Overlay -->
+    <div id="hover-thumbnail"
+        style="display:none; position:fixed; z-index:9999; border-radius:12px; overflow:hidden; box-shadow: 0 15px 35px rgba(0,0,0,0.4); pointer-events:none; width: 220px; height: 220px; background: #111; transition: opacity 0.25s ease; opacity:0;">
+        <div class="text-center w-100 h-100 d-flex align-items-center justify-content-center text-white"
+            id="hover-thumbnail-loading"
+            style="position:absolute; inset:0; font-family:'Outfit',sans-serif; font-size:12px;">Cargando...</div>
+        <img id="hover-thumbnail-img" src=""
+            style="width:100%; height:100%; object-fit:contain; position:relative; z-index:2;"
+            onload="document.getElementById('hover-thumbnail-loading').style.display='none';" />
+    </div>
+
+    <!-- Barra Inferior de Descarga Múltiple -->
+    <div id="batch-download-bar" class="fixed-bottom shadow-lg p-3"
+        style="background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(12px); border-top: 1px solid rgba(255,255,255,0.3); transform: translateY(100%); transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1); z-index: 1040;">
+        <div class="container d-flex justify-content-between align-items-center">
+            <div>
+                <h5 class="mb-0 text-dark fw-bold" id="batch-count" style="font-family: 'Outfit', sans-serif;">0
+                    estudios seleccionados</h5>
+                <small class="text-muted">Se descargarán automáticamente como archivos individuales.</small>
+            </div>
+            <button id="btn-batch-download" class="btn btn-primary d-inline-flex align-items-center"
+                style="border-radius:20px; padding: 10px 24px;">
+                <i class="bi bi-cloud-arrow-down-fill me-2 fs-5"></i> Descargar Seleccionados
+            </button>
         </div>
     </div>
 
@@ -3307,7 +3465,141 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
         var tmpWritable = <?php echo ($tmpWritable ? 'true' : 'false'); ?>;
         var downloadSupportMessage = <?php echo json_encode($downloadSupportMessage); ?>;
         window.bindTableActions = function () {
-            // Descargar button logic
+            // Compartir link handler (Con Soporte HTTP via execCommand)
+            window.copyShare = function (btn, url) {
+                var copyExec = function () {
+                    var icon = btn.querySelector('i');
+                    if (icon) icon.className = 'bi bi-check2-circle';
+                    btn.classList.add('btn-success');
+                    btn.classList.remove('btn-outline-info');
+                    setTimeout(function () {
+                        if (icon) icon.className = 'bi bi-share';
+                        btn.classList.remove('btn-success');
+                        btn.classList.add('btn-outline-info');
+                    }, 2000);
+                };
+                if (navigator.clipboard && window.isSecureContext) {
+                    navigator.clipboard.writeText(url).then(copyExec).catch(function (e) { fallbackCopy(url); copyExec(); });
+                } else {
+                    fallbackCopy(url);
+                    copyExec();
+                }
+                function fallbackCopy(text) {
+                    var t = document.createElement("textarea");
+                    t.value = text;
+                    t.style.top = "0"; t.style.left = "0"; t.style.position = "fixed";
+                    document.body.appendChild(t);
+                    t.focus(); t.select();
+                    try { document.execCommand('copy'); } catch (err) { }
+                    document.body.removeChild(t);
+                }
+            };
+
+            // Hover Thumbnails Logic
+            var thumbDiv = document.getElementById('hover-thumbnail');
+            var thumbImg = document.getElementById('hover-thumbnail-img');
+            var thumbLoad = document.getElementById('hover-thumbnail-loading');
+            var hoverTimeout;
+
+            document.querySelectorAll('tr.study-row').forEach(function (row) {
+                row.addEventListener('mouseenter', function (e) {
+                    var uid = row.dataset.uid;
+                    if (!uid) return;
+                    clearTimeout(hoverTimeout);
+                    thumbLoad.style.display = 'flex';
+                    thumbImg.src = '';
+                    hoverTimeout = setTimeout(() => {
+                        thumbImg.src = '?action=thumbnail&study_uid=' + encodeURIComponent(uid);
+                        thumbDiv.style.opacity = '1';
+                        // Position instantly to avoid jumping
+                        var x = e.clientX + 20; var y = e.clientY + 20;
+                        if (x + 220 > window.innerWidth) x = window.innerWidth - 240;
+                        if (y + 220 > window.innerHeight) y = window.innerHeight - 240;
+                        thumbDiv.style.left = x + 'px';
+                        thumbDiv.style.top = y + 'px';
+                        thumbDiv.style.display = 'block';
+                    }, 400); // Demora intencional para no saturar al pasar el ratón rápido
+                });
+                row.addEventListener('mouseleave', function () {
+                    clearTimeout(hoverTimeout);
+                    thumbDiv.style.opacity = '0';
+                    setTimeout(() => { if (thumbDiv.style.opacity === '0') thumbDiv.style.display = 'none'; }, 200);
+                });
+                row.addEventListener('mousemove', function (e) {
+                    if (thumbDiv.style.display === 'block') {
+                        var x = e.clientX + 20; var y = e.clientY + 20;
+                        if (x + 220 > window.innerWidth) x = window.innerWidth - 240;
+                        if (y + 220 > window.innerHeight) y = window.innerHeight - 240;
+                        thumbDiv.style.left = x + 'px';
+                        thumbDiv.style.top = y + 'px';
+                    }
+                });
+            });
+
+            // Batch selection logic
+            var checkAll = document.getElementById('check-all-batch');
+            var batchCount = document.getElementById('batch-count');
+            var batchBar = document.getElementById('batch-download-bar');
+            var btnBatchDl = document.getElementById('btn-batch-download');
+
+            function updateBatchUI() {
+                var selected = document.querySelectorAll('.batch-cb:checked').length;
+                if (selected > 0) {
+                    batchCount.innerText = selected + (selected === 1 ? ' estudio seleccionado' : ' estudios seleccionados');
+                    batchBar.style.transform = 'translateY(0)';
+                } else {
+                    batchBar.style.transform = 'translateY(100%)';
+                }
+            }
+
+            if (checkAll) {
+                checkAll.addEventListener('change', function () {
+                    var isChecked = this.checked;
+                    document.querySelectorAll('.batch-cb').forEach(function (cb) {
+                        cb.checked = isChecked;
+                    });
+                    updateBatchUI();
+                });
+            }
+
+            document.querySelectorAll('.batch-cb').forEach(function (cb) {
+                cb.addEventListener('change', updateBatchUI);
+            });
+
+            if (btnBatchDl) {
+                btnBatchDl.replaceWith(btnBatchDl.cloneNode(true));
+                btnBatchDl = document.getElementById('btn-batch-download');
+                btnBatchDl.addEventListener('click', function () {
+                    var selected = document.querySelectorAll('.batch-cb:checked');
+                    if (selected.length === 0) return;
+
+                    var overlay = document.getElementById('action-overlay');
+                    if (overlay) {
+                        overlay.innerHTML = '<div class="text-center"><div class="spinner-border text-primary" role="status" style="width:3rem;height:3rem;"></div><div class="mt-3 fw-bold text-dark fs-5">Descargas Iniciadas</div><div class="mt-2 text-dark">Preparando ' + selected.length + ' estudios simultáneamente.<br>Por favor sigue operando normalmente.</div></div>';
+                        // Reducir agresivamente el retraso del bloqueo visual
+                        overlay.style.display = 'flex';
+                        setTimeout(function () { overlay.style.display = 'none'; }, 2000);
+                    }
+
+                    selected.forEach(function (cb, index) {
+                        setTimeout(function () {
+                            var uid = cb.value;
+                            var qId = cb.dataset.query;
+                            var aIdx = cb.dataset.answer;
+                            var href = '?action=download&study_uid=' + encodeURIComponent(uid);
+                            if (qId && aIdx) href += '&query_id=' + encodeURIComponent(qId) + '&answer_idx=' + encodeURIComponent(aIdx);
+                            else href += '&download_now=1';
+
+                            var iframe = document.createElement('iframe');
+                            iframe.style.display = 'none';
+                            document.body.appendChild(iframe);
+                            iframe.src = href;
+                        }, index * 2500); // 2.5s iteraciones
+                    });
+                });
+            }
+
+            // Descargar button logic single
             document.querySelectorAll('.btn-download').forEach(function (el) {
                 // Remove existing listener if any to avoid duplicates
                 el.replaceWith(el.cloneNode(true));
@@ -3323,11 +3615,9 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
 
                     var overlay = document.getElementById('action-overlay');
                     if (overlay) {
-                        overlay.innerHTML = '<div class="text-center"><div class="spinner-border text-primary" role="status" style="width:3rem;height:3rem;"></div><div class="mt-3 fw-bold text-dark fs-5">Preparando archivo ZIP...</div><div class="mt-2 text-dark">Dependiendo del tamaño de las imágenes, esto tardará un momento.<br>Por favor sigue operando normalmente.</div></div>';
+                        overlay.innerHTML = '<div class="text-center"><div class="spinner-border text-primary" role="status" style="width:3rem;height:3rem;"></div><div class="mt-3 fw-bold text-dark fs-5">Preparando archivo ZIP...</div><div class="mt-2 text-dark">La descarga se lanzará en segundo plano.</div></div>';
                         overlay.style.display = 'flex';
-                        setTimeout(function () {
-                            overlay.style.display = 'none';
-                        }, 12000); 
+                        setTimeout(function () { overlay.style.display = 'none'; }, 2000);
                     }
 
                     // --- [MODIFICACIÓN] Descarga en Fondo (Iframe Oculto) ---
@@ -3369,24 +3659,58 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
         });
     </script>
 
-    <!-- Modal: full modalities list (moved inside body so JS can find it) -->
-    <div class="modal fade" id="modal-modalities-full" tabindex="-1" aria-labelledby="modalModalitiesFullLabel"
-        aria-hidden="true">
-        <div class="modal-dialog modal-dialog-centered">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h5 class="modal-title" id="modalModalitiesFullLabel">Modalidades disponibles</h5>
-                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Cerrar"></button>
-                </div>
-                <div class="modal-body">
-                    <!-- populated dynamically -->
-                </div>
-                <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
-                </div>
-            </div>
+    <!-- Offcanvas Panel (reemplaza modal-modalities-full) -->
+    <div class="offcanvas offcanvas-end shadow-lg" tabindex="-1" id="offcanvas-modalities"
+        aria-labelledby="offcanvasModalitiesLabel"
+        style="background: rgba(255,255,255,0.95); backdrop-filter: blur(16px); border-left: 1px solid rgba(255,255,255,0.4); width: 350px;">
+        <div class="offcanvas-header border-bottom border-light">
+            <h5 class="offcanvas-title fw-bold text-dark" id="offcanvasModalitiesLabel"
+                style="font-family:'Outfit',sans-serif;"><i class="bi bi-stack me-2 text-primary"></i>Modalidades</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Cerrar"></button>
+        </div>
+        <div class="offcanvas-body" id="offcanvas-modalities-body" style="font-size:1.05rem;">
+            <!-- populated dynamically -->
         </div>
     </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            var viewAllBtn = document.getElementById('modality-view-all');
+            if (viewAllBtn) {
+                var newBtn = viewAllBtn.cloneNode(true);
+                viewAllBtn.replaceWith(newBtn);
+                newBtn.addEventListener('click', function (e) {
+                    e.preventDefault();
+                    var allBtns = Array.from(document.querySelectorAll('#modality-options .modality-item'));
+                    var offc = document.getElementById('offcanvas-modalities');
+                    if (offc) {
+                        var body = document.getElementById('offcanvas-modalities-body');
+                        if (body) {
+                            body.innerHTML = '';
+                            var ul = document.createElement('ul'); ul.className = 'list-unstyled mb-0 d-grid gap-2';
+                            allBtns.forEach(function (b) {
+                                var li = document.createElement('li');
+                                li.className = 'p-2 rounded rounded-3 border align-items-center d-flex justify-content-between';
+                                li.style.background = b.classList.contains('selected') ? 'rgba(13, 110, 253, 0.1)' : 'transparent';
+                                li.style.borderColor = b.classList.contains('selected') ? 'rgba(13, 110, 253, 0.3)' : 'inherit';
+
+                                var txt = b.getAttribute('data-value');
+                                if (b.classList.contains('selected')) {
+                                    li.innerHTML = '<span class="fw-bold text-primary">' + txt + '</span><span class="badge bg-primary rounded-pill">Activo</span>';
+                                } else {
+                                    li.innerHTML = '<span class="text-dark">' + txt + '</span>';
+                                }
+                                ul.appendChild(li);
+                            });
+                            body.appendChild(ul);
+                        }
+                        var bsOff = bootstrap.Offcanvas.getInstance(offc) || new bootstrap.Offcanvas(offc);
+                        bsOff.show();
+                    }
+                });
+            }
+        });
+    </script>
 
     </div>
     <!-- Premium Features Addons -->
@@ -3403,8 +3727,7 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                 role="alert" aria-live="assertive" aria-atomic="true">
                 <div class="d-flex">
                     <div class="toast-body" style="font-family: 'Outfit', sans-serif; font-size: 1.05rem;">
-                        <?php echo $status === 'ok' ? '✅' : '⚠️'; ?>
-                        <?php echo htmlspecialchars($message, ENT_QUOTES); ?>
+                        <?php echo $status === 'ok' ? '✅' : '⚠️'; ?>     <?php echo htmlspecialchars($message, ENT_QUOTES); ?>
                     </div>
                     <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"
                         aria-label="Cerrar"></button>
@@ -3481,18 +3804,66 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                 }
             }
 
+            function setSkeletonLoader() {
+                let skeletonRows = '';
+                for (let i = 0; i < 7; i++) {
+                    skeletonRows += `
+                    <tr>
+                        <td><div class="skeleton-box" style="width: 20px; height: 20px; border-radius:4px;"></div></td>
+                        <td><div class="skeleton-box" style="width: 90px;"></div></td>
+                        <td><div class="skeleton-box" style="width: 120px;"></div></td>
+                        <td><div class="skeleton-box" style="width: 200px;"></div></td>
+                        <td><div class="skeleton-box" style="width: 70px;"></div></td>
+                        <td><div class="skeleton-box" style="width: 130px; border-radius:12px;"></div></td>
+                        <td><div class="skeleton-box" style="width: 250px;"></div></td>
+                        <td><div class="skeleton-box" style="width: 180px;"></div></td>
+                    </tr>`;
+                }
+                resultsContainer.innerHTML = `
+                    <style>
+                        .skeleton-box {
+                            display: inline-block; height: 18px; position: relative; overflow: hidden;
+                            background-color: rgba(226, 232, 240, 0.6); border-radius: 6px;
+                        }
+                        [data-theme="dark"] .skeleton-box { background-color: rgba(255,255,255,0.08); }
+                        .skeleton-box::after {
+                            position: absolute; top: 0; right: 0; bottom: 0; left: 0; transform: translateX(-100%);
+                            background-image: linear-gradient(90deg, rgba(255,255,255,0) 0, rgba(255,255,255,0.5) 20%, rgba(255,255,255,0.8) 60%, rgba(255,255,255,0));
+                            animation: shimmer 1.5s infinite; content: '';
+                        }
+                        [data-theme="dark"] .skeleton-box::after {
+                            background-image: linear-gradient(90deg, rgba(255,255,255,0) 0, rgba(255,255,255,0.1) 20%, rgba(255,255,255,0.2) 60%, rgba(255,255,255,0));
+                        }
+                        @keyframes shimmer { 100% { transform: translateX(100%); } }
+                    </style>
+                    <div class="table-responsive" style="opacity: 0.8;">
+                        <table class="table table-sm table-striped">
+                            <thead>
+                                <tr>
+                                    <th>Cargando...</th><th>Cargando...</th><th>Cargando...</th><th>Cargando...</th>
+                                    <th>Cargando...</th><th>Cargando...</th><th>Cargando...</th><th>Cargando...</th>
+                                </tr>
+                            </thead>
+                            <tbody>${skeletonRows}</tbody>
+                        </table>
+                    </div>
+                `;
+            }
+
             function performAjaxSearch(urlStr) {
-                if (loadingOverlay) loadingOverlay.classList.add('active');
+                setSkeletonLoader(); // UX: Cambia la pantalla oscura por la tabla fantasma elegante
                 fetch(urlStr)
                     .then(res => res.json())
                     .then(data => {
                         if (data.html !== undefined) {
+                            // Fade in efecto
+                            resultsContainer.style.opacity = '0';
                             resultsContainer.innerHTML = data.html;
+                            setTimeout(() => { resultsContainer.style.transition = 'opacity 0.4s ease'; resultsContainer.style.opacity = '1'; }, 50);
                         }
                         if (data.status && data.message) {
                             showSystemToast(data.status, data.message);
                         }
-                        if (loadingOverlay) loadingOverlay.classList.remove('active');
 
                         // Re-bind table actions seamlessly
                         if (typeof window.bindTableActions === 'function') {

@@ -685,7 +685,8 @@ if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 't
                     }
                 }
             }
-        } catch (Exception $e) { /* Silently fall back to empty png */ }
+        } catch (Exception $e) { /* Silently fall back to empty png */
+        }
     }
     // Pixel transparente
     header('Content-Type: image/png');
@@ -696,7 +697,7 @@ if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 't
 $isSharedAccess = false;
 if (isset($_GET['action']) && $_GET['action'] === 'view_shared') {
     $uid = trim($_GET['study_uid'] ?? '');
-    $exp = (int)($_GET['exp'] ?? 0);
+    $exp = (int) ($_GET['exp'] ?? 0);
     $sig = trim($_GET['sig'] ?? '');
     $expectedSig = hash_hmac('sha256', $uid . '|' . $exp, $SHARE_SECRET);
     if ($exp > time() && hash_equals($expectedSig, $sig)) {
@@ -2825,32 +2826,42 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
 
         /* --- Dark Mode para Componentes Premium Nuevos --- */
         [data-theme="dark"] #offcanvas-modalities {
-            background: rgba(30, 41, 59, 0.95)!important;
-            border-left-color: rgba(255, 255, 255, 0.1)!important;
+            background: rgba(30, 41, 59, 0.95) !important;
+            border-left-color: rgba(255, 255, 255, 0.1) !important;
         }
+
         [data-theme="dark"] #offcanvas-modalities .text-dark,
         [data-theme="dark"] #offcanvasModalitiesLabel {
             color: #f1f5f9 !important;
         }
+
         [data-theme="dark"] #offcanvas-modalities li {
-            border-color: rgba(255,255,255,0.1) !important;
+            border-color: rgba(255, 255, 255, 0.1) !important;
         }
+
         [data-theme="dark"] #offcanvas-modalities .btn-close {
             filter: invert(1) grayscale(100%) brightness(200%);
         }
+
         [data-theme="dark"] #batch-download-bar {
-            background: rgba(30, 41, 59, 0.95)!important;
-            border-top-color: rgba(255, 255, 255, 0.1)!important;
+            background: rgba(30, 41, 59, 0.95) !important;
+            border-top-color: rgba(255, 255, 255, 0.1) !important;
         }
+
         [data-theme="dark"] #batch-download-bar .text-dark {
             color: #f1f5f9 !important;
         }
+
         [data-theme="dark"] #batch-download-bar .text-muted {
             color: #94a3b8 !important;
         }
-        [data-theme="dark"] .skeleton-box { background-color: rgba(255,255,255,0.08) !important; }
+
+        [data-theme="dark"] .skeleton-box {
+            background-color: rgba(255, 255, 255, 0.08) !important;
+        }
+
         [data-theme="dark"] .skeleton-box::after {
-            background-image: linear-gradient(90deg, rgba(255,255,255,0) 0, rgba(255,255,255,0.1) 20%, rgba(255,255,255,0.2) 60%, rgba(255,255,255,0)) !important;
+            background-image: linear-gradient(90deg, rgba(255, 255, 255, 0) 0, rgba(255, 255, 255, 0.1) 20%, rgba(255, 255, 255, 0.2) 60%, rgba(255, 255, 255, 0)) !important;
         }
     </style>
 </head>
@@ -3104,7 +3115,8 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                             <thead>
                                                 <tr>
                                                     <th style="width:40px;">
-                                                        <input type="checkbox" class="form-check-input" id="check-all-batch" title="Seleccionar todos">
+                                                        <input type="checkbox" class="form-check-input" id="check-all-batch"
+                                                            title="Seleccionar todos">
                                                     </th>
                                                     <th><a href="?sort=date&page=1&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?>"
                                                             style="color: inherit; text-decoration: none;">Fecha<?php if ($sort === 'date')
@@ -3237,9 +3249,13 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                     $sig = hash_hmac('sha256', $studyUid . '|' . $exp, $SHARE_SECRET);
                                                     $shareUrl = "http://" . $_SERVER['HTTP_HOST'] . $_SERVER['PHP_SELF'] . "?action=view_shared&study_uid=" . urlencode($studyUid) . "&exp=$exp&sig=$sig";
                                                     ?>
-                                                    <tr class="study-row" data-uid="<?php echo htmlspecialchars($studyUid, ENT_QUOTES); ?>">
+                                                    <tr class="study-row"
+                                                        data-uid="<?php echo htmlspecialchars($studyUid, ENT_QUOTES); ?>">
                                                         <td class="text-center">
-                                                            <input type="checkbox" class="form-check-input batch-cb" value="<?php echo htmlspecialchars($studyUid, ENT_QUOTES); ?>" data-query="<?php echo htmlspecialchars($s['_remote']['queryId'] ?? ($_SESSION['last_query']['id'] ?? ''), ENT_QUOTES); ?>" data-answer="<?php echo htmlspecialchars($s['_remote']['answerIdx'] ?? '', ENT_QUOTES); ?>">
+                                                            <input type="checkbox" class="form-check-input batch-cb"
+                                                                value="<?php echo htmlspecialchars($studyUid, ENT_QUOTES); ?>"
+                                                                data-query="<?php echo htmlspecialchars($s['_remote']['queryId'] ?? ($_SESSION['last_query']['id'] ?? ''), ENT_QUOTES); ?>"
+                                                                data-answer="<?php echo htmlspecialchars($s['_remote']['answerIdx'] ?? '', ENT_QUOTES); ?>">
                                                         </td>
                                                         <td data-label="Fecha">
                                                             <?php echo htmlspecialchars($dateText ?: 'N/D', ENT_QUOTES); ?>
@@ -3287,7 +3303,10 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                                         title="Descargar imágenes JPG">
                                                                         <i class="bi bi-download"></i> Descargar
                                                                     </a>
-                                                                    <button type="button" class="btn btn-outline-info btn-sm ms-1 btn-share" onclick="copyShare(this, '<?php echo $shareUrl; ?>')" data-bs-toggle="tooltip" title="Copiar enlace (24h)"><i class="bi bi-share"></i></button>
+                                                                    <button type="button" class="btn btn-outline-info btn-sm ms-1 btn-share"
+                                                                        onclick="copyShare(this, '<?php echo $shareUrl; ?>')"
+                                                                        data-bs-toggle="tooltip" title="Copiar enlace (24h)"><i
+                                                                            class="bi bi-share"></i></button>
                                                                     <?php
                                                                 else: ?>
                                                                     <a href="?action=view&study_uid=<?php echo urlencode($studyUid); ?>&query_id=<?php echo urlencode($s['_remote']['queryId'] ?? ($_SESSION['last_query']['id'] ?? '')); ?>&answer_idx=<?php echo urlencode($s['_remote']['answerIdx'] ?? ''); ?>"
@@ -3302,7 +3321,10 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                                         title="Descargar imágenes JPG">
                                                                         <i class="bi bi-download"></i> Descargar
                                                                     </a>
-                                                                    <button type="button" class="btn btn-outline-info btn-sm ms-1 btn-share" onclick="copyShare(this, '<?php echo $shareUrl; ?>')" data-bs-toggle="tooltip" title="Copiar enlace (24h)"><i class="bi bi-share"></i></button>
+                                                                    <button type="button" class="btn btn-outline-info btn-sm ms-1 btn-share"
+                                                                        onclick="copyShare(this, '<?php echo $shareUrl; ?>')"
+                                                                        data-bs-toggle="tooltip" title="Copiar enlace (24h)"><i
+                                                                            class="bi bi-share"></i></button>
                                                                     <div class="small text-muted mt-1">Si el estudio no está en Orthanc se
                                                                         iniciará su traslado y se esperará antes de descargar.</div>
                                                                     <?php
@@ -3411,19 +3433,27 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
     </div>
 
     <!-- Thumbnail Overlay -->
-    <div id="hover-thumbnail" style="display:none; position:fixed; z-index:9999; border-radius:12px; overflow:hidden; box-shadow: 0 15px 35px rgba(0,0,0,0.4); pointer-events:none; width: 220px; height: 220px; background: #111; transition: opacity 0.25s ease; opacity:0;">
-        <div class="text-center w-100 h-100 d-flex align-items-center justify-content-center text-white" id="hover-thumbnail-loading" style="position:absolute; inset:0; font-family:'Outfit',sans-serif; font-size:12px;">Cargando...</div>
-        <img id="hover-thumbnail-img" src="" style="width:100%; height:100%; object-fit:contain; position:relative; z-index:2;" onload="document.getElementById('hover-thumbnail-loading').style.display='none';" />
+    <div id="hover-thumbnail"
+        style="display:none; position:fixed; z-index:9999; border-radius:12px; overflow:hidden; box-shadow: 0 15px 35px rgba(0,0,0,0.4); pointer-events:none; width: 220px; height: 220px; background: #111; transition: opacity 0.25s ease; opacity:0;">
+        <div class="text-center w-100 h-100 d-flex align-items-center justify-content-center text-white"
+            id="hover-thumbnail-loading"
+            style="position:absolute; inset:0; font-family:'Outfit',sans-serif; font-size:12px;">Cargando...</div>
+        <img id="hover-thumbnail-img" src=""
+            style="width:100%; height:100%; object-fit:contain; position:relative; z-index:2;"
+            onload="document.getElementById('hover-thumbnail-loading').style.display='none';" />
     </div>
 
     <!-- Barra Inferior de Descarga Múltiple -->
-    <div id="batch-download-bar" class="fixed-bottom shadow-lg p-3" style="background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(12px); border-top: 1px solid rgba(255,255,255,0.3); transform: translateY(100%); transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1); z-index: 1040;">
+    <div id="batch-download-bar" class="fixed-bottom shadow-lg p-3"
+        style="background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(12px); border-top: 1px solid rgba(255,255,255,0.3); transform: translateY(100%); transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1); z-index: 1040;">
         <div class="container d-flex justify-content-between align-items-center">
             <div>
-                <h5 class="mb-0 text-dark fw-bold" id="batch-count" style="font-family: 'Outfit', sans-serif;">0 estudios seleccionados</h5>
+                <h5 class="mb-0 text-dark fw-bold" id="batch-count" style="font-family: 'Outfit', sans-serif;">0
+                    estudios seleccionados</h5>
                 <small class="text-muted">Se descargarán automáticamente como archivos individuales.</small>
             </div>
-            <button id="btn-batch-download" class="btn btn-primary d-inline-flex align-items-center" style="border-radius:20px; padding: 10px 24px;">
+            <button id="btn-batch-download" class="btn btn-primary d-inline-flex align-items-center"
+                style="border-radius:20px; padding: 10px 24px;">
                 <i class="bi bi-cloud-arrow-down-fill me-2 fs-5"></i> Descargar Seleccionados
             </button>
         </div>
@@ -3436,20 +3466,20 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
         var downloadSupportMessage = <?php echo json_encode($downloadSupportMessage); ?>;
         window.bindTableActions = function () {
             // Compartir link handler (Con Soporte HTTP via execCommand)
-            window.copyShare = function(btn, url) {
-                var copyExec = function() {
+            window.copyShare = function (btn, url) {
+                var copyExec = function () {
                     var icon = btn.querySelector('i');
                     if (icon) icon.className = 'bi bi-check2-circle';
                     btn.classList.add('btn-success');
                     btn.classList.remove('btn-outline-info');
-                    setTimeout(function() {
-                        if(icon) icon.className = 'bi bi-share';
+                    setTimeout(function () {
+                        if (icon) icon.className = 'bi bi-share';
                         btn.classList.remove('btn-success');
                         btn.classList.add('btn-outline-info');
                     }, 2000);
                 };
                 if (navigator.clipboard && window.isSecureContext) {
-                    navigator.clipboard.writeText(url).then(copyExec).catch(function(e){ fallbackCopy(url); copyExec(); });
+                    navigator.clipboard.writeText(url).then(copyExec).catch(function (e) { fallbackCopy(url); copyExec(); });
                 } else {
                     fallbackCopy(url);
                     copyExec();
@@ -3460,7 +3490,7 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                     t.style.top = "0"; t.style.left = "0"; t.style.position = "fixed";
                     document.body.appendChild(t);
                     t.focus(); t.select();
-                    try { document.execCommand('copy'); } catch (err) {}
+                    try { document.execCommand('copy'); } catch (err) { }
                     document.body.removeChild(t);
                 }
             };
@@ -3470,14 +3500,14 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
             var thumbImg = document.getElementById('hover-thumbnail-img');
             var thumbLoad = document.getElementById('hover-thumbnail-loading');
             var hoverTimeout;
-            
-            document.querySelectorAll('tr.study-row').forEach(function(row) {
-                row.addEventListener('mouseenter', function(e) {
+
+            document.querySelectorAll('tr.study-row').forEach(function (row) {
+                row.addEventListener('mouseenter', function (e) {
                     var uid = row.dataset.uid;
                     if (!uid) return;
                     clearTimeout(hoverTimeout);
                     thumbLoad.style.display = 'flex';
-                    thumbImg.src = ''; 
+                    thumbImg.src = '';
                     hoverTimeout = setTimeout(() => {
                         thumbImg.src = '?action=thumbnail&study_uid=' + encodeURIComponent(uid);
                         thumbDiv.style.opacity = '1';
@@ -3490,12 +3520,12 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                         thumbDiv.style.display = 'block';
                     }, 400); // Demora intencional para no saturar al pasar el ratón rápido
                 });
-                row.addEventListener('mouseleave', function() {
+                row.addEventListener('mouseleave', function () {
                     clearTimeout(hoverTimeout);
                     thumbDiv.style.opacity = '0';
                     setTimeout(() => { if (thumbDiv.style.opacity === '0') thumbDiv.style.display = 'none'; }, 200);
                 });
-                row.addEventListener('mousemove', function(e) {
+                row.addEventListener('mousemove', function (e) {
                     if (thumbDiv.style.display === 'block') {
                         var x = e.clientX + 20; var y = e.clientY + 20;
                         if (x + 220 > window.innerWidth) x = window.innerWidth - 240;
@@ -3523,43 +3553,43 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
             }
 
             if (checkAll) {
-                checkAll.addEventListener('change', function() {
+                checkAll.addEventListener('change', function () {
                     var isChecked = this.checked;
-                    document.querySelectorAll('.batch-cb').forEach(function(cb) {
+                    document.querySelectorAll('.batch-cb').forEach(function (cb) {
                         cb.checked = isChecked;
                     });
                     updateBatchUI();
                 });
             }
 
-            document.querySelectorAll('.batch-cb').forEach(function(cb) {
+            document.querySelectorAll('.batch-cb').forEach(function (cb) {
                 cb.addEventListener('change', updateBatchUI);
             });
 
             if (btnBatchDl) {
                 btnBatchDl.replaceWith(btnBatchDl.cloneNode(true));
                 btnBatchDl = document.getElementById('btn-batch-download');
-                btnBatchDl.addEventListener('click', function() {
+                btnBatchDl.addEventListener('click', function () {
                     var selected = document.querySelectorAll('.batch-cb:checked');
                     if (selected.length === 0) return;
-                    
+
                     var overlay = document.getElementById('action-overlay');
                     if (overlay) {
                         overlay.innerHTML = '<div class="text-center"><div class="spinner-border text-primary" role="status" style="width:3rem;height:3rem;"></div><div class="mt-3 fw-bold text-dark fs-5">Descargas Iniciadas</div><div class="mt-2 text-dark">Preparando ' + selected.length + ' estudios simultáneamente.<br>Por favor sigue operando normalmente.</div></div>';
                         // Reducir agresivamente el retraso del bloqueo visual
                         overlay.style.display = 'flex';
-                        setTimeout(function () { overlay.style.display = 'none'; }, 2000); 
+                        setTimeout(function () { overlay.style.display = 'none'; }, 2000);
                     }
 
-                    selected.forEach(function(cb, index) {
-                        setTimeout(function() {
+                    selected.forEach(function (cb, index) {
+                        setTimeout(function () {
                             var uid = cb.value;
                             var qId = cb.dataset.query;
                             var aIdx = cb.dataset.answer;
                             var href = '?action=download&study_uid=' + encodeURIComponent(uid);
                             if (qId && aIdx) href += '&query_id=' + encodeURIComponent(qId) + '&answer_idx=' + encodeURIComponent(aIdx);
                             else href += '&download_now=1';
-                            
+
                             var iframe = document.createElement('iframe');
                             iframe.style.display = 'none';
                             document.body.appendChild(iframe);
@@ -3587,7 +3617,7 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                     if (overlay) {
                         overlay.innerHTML = '<div class="text-center"><div class="spinner-border text-primary" role="status" style="width:3rem;height:3rem;"></div><div class="mt-3 fw-bold text-dark fs-5">Preparando archivo ZIP...</div><div class="mt-2 text-dark">La descarga se lanzará en segundo plano.</div></div>';
                         overlay.style.display = 'flex';
-                        setTimeout(function () { overlay.style.display = 'none'; }, 2000); 
+                        setTimeout(function () { overlay.style.display = 'none'; }, 2000);
                     }
 
                     // --- [MODIFICACIÓN] Descarga en Fondo (Iframe Oculto) ---
@@ -3630,39 +3660,42 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
     </script>
 
     <!-- Offcanvas Panel (reemplaza modal-modalities-full) -->
-    <div class="offcanvas offcanvas-end shadow-lg" tabindex="-1" id="offcanvas-modalities" aria-labelledby="offcanvasModalitiesLabel" style="background: rgba(255,255,255,0.95); backdrop-filter: blur(16px); border-left: 1px solid rgba(255,255,255,0.4); width: 350px;">
+    <div class="offcanvas offcanvas-end shadow-lg" tabindex="-1" id="offcanvas-modalities"
+        aria-labelledby="offcanvasModalitiesLabel"
+        style="background: rgba(255,255,255,0.95); backdrop-filter: blur(16px); border-left: 1px solid rgba(255,255,255,0.4); width: 350px;">
         <div class="offcanvas-header border-bottom border-light">
-            <h5 class="offcanvas-title fw-bold text-dark" id="offcanvasModalitiesLabel" style="font-family:'Outfit',sans-serif;"><i class="bi bi-stack me-2 text-primary"></i>Modalidades</h5>
+            <h5 class="offcanvas-title fw-bold text-dark" id="offcanvasModalitiesLabel"
+                style="font-family:'Outfit',sans-serif;"><i class="bi bi-stack me-2 text-primary"></i>Modalidades</h5>
             <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Cerrar"></button>
         </div>
         <div class="offcanvas-body" id="offcanvas-modalities-body" style="font-size:1.05rem;">
             <!-- populated dynamically -->
         </div>
     </div>
-    
+
     <script>
-        document.addEventListener('DOMContentLoaded', function() {
+        document.addEventListener('DOMContentLoaded', function () {
             var viewAllBtn = document.getElementById('modality-view-all');
             if (viewAllBtn) {
                 var newBtn = viewAllBtn.cloneNode(true);
                 viewAllBtn.replaceWith(newBtn);
-                newBtn.addEventListener('click', function(e) {
+                newBtn.addEventListener('click', function (e) {
                     e.preventDefault();
                     var allBtns = Array.from(document.querySelectorAll('#modality-options .modality-item'));
                     var offc = document.getElementById('offcanvas-modalities');
-                    if(offc){
+                    if (offc) {
                         var body = document.getElementById('offcanvas-modalities-body');
-                        if(body){
+                        if (body) {
                             body.innerHTML = '';
                             var ul = document.createElement('ul'); ul.className = 'list-unstyled mb-0 d-grid gap-2';
-                            allBtns.forEach(function(b){
+                            allBtns.forEach(function (b) {
                                 var li = document.createElement('li');
                                 li.className = 'p-2 rounded rounded-3 border align-items-center d-flex justify-content-between';
                                 li.style.background = b.classList.contains('selected') ? 'rgba(13, 110, 253, 0.1)' : 'transparent';
                                 li.style.borderColor = b.classList.contains('selected') ? 'rgba(13, 110, 253, 0.3)' : 'inherit';
-                                
+
                                 var txt = b.getAttribute('data-value');
-                                if(b.classList.contains('selected')){
+                                if (b.classList.contains('selected')) {
                                     li.innerHTML = '<span class="fw-bold text-primary">' + txt + '</span><span class="badge bg-primary rounded-pill">Activo</span>';
                                 } else {
                                     li.innerHTML = '<span class="text-dark">' + txt + '</span>';
