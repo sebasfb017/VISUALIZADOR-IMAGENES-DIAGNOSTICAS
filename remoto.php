@@ -718,7 +718,10 @@ if ((isset($_SESSION['user']) || $isSharedAccess) && isset($_GET['action']) && (
         die('Error de Seguridad: StudyInstanceUID proveído contiene caracteres no permitidos.');
     }
 
-    $queryId = trim($_GET['query_id'] ?? '') ?: (isset($_SESSION['last_query']['id']) ? $_SESSION['last_query']['id'] : null);
+    $queryId = trim($_GET['query_id'] ?? '');
+    if ($queryId === '') {
+        $queryId = isset($_SESSION['last_query']['id']) ? $_SESSION['last_query']['id'] : '';
+    }
     $answerIdx = trim($_GET['answer_idx'] ?? '');
 
     if ($studyUid === '') {
@@ -766,6 +769,11 @@ if ((isset($_SESSION['user']) || $isSharedAccess) && isset($_GET['action']) && (
 
             // Abrir OHIF
             $ohifUrl = rtrim($OHIF_BASE_URL, '/') . rtrim($OHIF_VIEWER_PATH, '/') . urlencode($studyUid);
+            
+            if (!$doRetrieve) {
+                header('Location: ' . $ohifUrl);
+                exit;
+            }
             $waitTime = 0; // Se esperará el retrieve antes de mostrar la página
             $loading = true;
         } catch (Exception $e) {
@@ -1342,7 +1350,10 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
         if (!orthancStudyExists($studyUid)) {
             // En lugar de fallar, intentar iniciar retrieve automáticamente y redirigir a la página de espera
             $queryId = trim($_GET['query_id'] ?? '');
-            $answerIdx = trim($_GET['answer_idx'] ?? '');
+    if ($queryId === '') {
+        $queryId = isset($_SESSION['last_query']['id']) ? $_SESSION['last_query']['id'] : '';
+    }
+    $answerIdx = trim($_GET['answer_idx'] ?? '');
 
             // intentar recuperar desde session si no vienen en la URL
             if (($queryId === '' || $answerIdx === '') && isset($_SESSION['last_search_results']) && is_array($_SESSION['last_search_results'])) {
@@ -1553,6 +1564,9 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
 
     // Si no existe, intentamos iniciar el retrieve y luego mostrar la página de espera
     $queryId = trim($_GET['query_id'] ?? '');
+    if ($queryId === '') {
+        $queryId = isset($_SESSION['last_query']['id']) ? $_SESSION['last_query']['id'] : '';
+    }
     $answerIdx = trim($_GET['answer_idx'] ?? '');
 
     // Si no vienen en la URL, intentar recuperarlos desde la sesión (resultados de búsqueda recientes)
