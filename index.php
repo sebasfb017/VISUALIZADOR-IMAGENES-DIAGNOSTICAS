@@ -175,28 +175,69 @@ function orthancStudyExists(string $studyUid): bool {
     return getOrthancStudyFullData($studyUid) !== null;
 }
 
+// Función auxiliar robusta para extraer el valor real de una etiqueta DICOM,
+// ya venga como cadena, array con clave 'Value', o estructura compleja.
+function extractTagValue($v) {
+    if ($v === null) return '';
+    if (is_string($v)) return trim($v);
+    if (is_numeric($v)) return (string) $v;
+    if (is_array($v)) {
+        if (isset($v['Value']) && is_array($v['Value']) && count($v['Value']) > 0) {
+            $first = $v['Value'][0];
+            if (is_array($first) || is_object($first)) {
+                return trim(json_encode($first));
+            }
+            return trim((string) $first);
+        }
+        if (isset($v['Alphabetic'])) {
+            return trim((string) $v['Alphabetic']);
+        }
+        $flat = [];
+        foreach ($v as $k => $val) {
+            if (is_array($val) || is_object($val)) continue;
+            $s = trim((string) $val);
+            if ($s !== '') $flat[] = $s;
+        }
+        if (!empty($flat)) return implode(' ', $flat);
+        foreach ($v as $item) {
+            if (is_string($item) || is_numeric($item)) return trim((string) $item);
+            if (is_array($item) && isset($item['Value']) && is_array($item['Value']) && count($item['Value']) > 0) return trim((string) $item['Value'][0]);
+        }
+        return '';
+    }
+    if (is_object($v)) {
+        return trim(json_encode($v));
+    }
+    return '';
+}
+
 // Normaliza contenido simplificado de una respuesta de query a un set de MainDicomTags
 function normalizeQueryContent(array $c): array {
     $tags = [];
     // StudyInstanceUID: buscar en varias claves (puede venir como '0020,000D' o StudyInstanceUID)
-    $tags['StudyInstanceUID'] = $c['StudyInstanceUID'] ?? $c['0020,000D'] ?? null;
-    $tags['StudyDate'] = $c['StudyDate'] ?? ($c['0008,0020'] ?? null) ?? null;
+    $uidRaw = $c['StudyInstanceUID'] ?? $c['0020,000D'] ?? $c['0020,000d'] ?? null;
+    $tags['StudyInstanceUID'] = $uidRaw !== null ? extractTagValue($uidRaw) : null;
 
-    // Patient / Nombre: buscar PatientName en varias formas
-    $rawName = $c['PatientName'] ?? $c['0010,0010'] ?? $c['Patient'] ?? '';
-    if (is_array($rawName)) {
-        // intentamos normalizar estructuras complejas
-        if (isset($rawName['Alphabetic'])) {
-            $rawName = $rawName['Alphabetic'];
-        } else {
-            $rawName = implode(' ', array_filter(array_map('strval', $rawName)));
-        }
+    // extraer StudyDate en múltiples formatos
+    $sd = '';
+    if (isset($c['StudyDate'])) {
+        $sd = extractTagValue($c['StudyDate']);
     }
-    $tags['PatientName'] = $rawName ?? '';
-    $tags['PatientID'] = $c['PatientID'] ?? $c['0010,0020'] ?? '';
+    if ($sd === '' && isset($c['0008,0020'])) {
+        $sd = extractTagValue($c['0008,0020']);
+    }
+    $tags['StudyDate'] = $sd ?: null;
+
+    // PatientName
+    $rawName = $c['PatientName'] ?? $c['0010,0010'] ?? $c['Patient'] ?? '';
+    $tags['PatientName'] = extractTagValue($rawName);
+
+    // PatientID
+    $tags['PatientID'] = extractTagValue($c['PatientID'] ?? $c['0010,0020'] ?? '');
 
     // Hora: preferir StudyTime, luego SeriesTime, AcquisitionTime
     $studyTime = $c['MainDicomTags']['StudyTime'] ?? $c['StudyTime'] ?? $c['SeriesTime'] ?? $c['AcquisitionTime'] ?? ($c['0008,0030'] ?? null) ?? '';
+    $studyTime = extractTagValue($studyTime);
     if (!empty($studyTime)) {
         $tags['StudyTime'] = $studyTime;
     }
@@ -213,7 +254,7 @@ function normalizeQueryContent(array $c): array {
     }
 
     // Descripción: StudyDescription, SeriesDescription, ProtocolName
-    $tags['StudyDescription'] = $c['StudyDescription'] ?? $c['SeriesDescription'] ?? $c['ProtocolName'] ?? '';
+    $tags['StudyDescription'] = extractTagValue($c['StudyDescription'] ?? $c['SeriesDescription'] ?? $c['ProtocolName'] ?? '');
 
     return $tags;
 }
@@ -473,24 +514,26 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
                 $query['Modality'] = $modalityValue;
             }
             // Always include Modality and StudyTime in the query to get them in the C-FIND response
-            $query['Modality'] = '*';
+            if (!isset($query['Modality'])) {
+                $query['Modality'] = '';
+            }
             $query['StudyTime'] = '';
             $query['StudyDescription'] = '';
 
             if ($forceRemote && empty($query)) {
-                $query['PatientID'] = '*';
-                $query['PatientName'] = '*';
+                $query['PatientID'] = '';
+                $query['PatientName'] = '';
             }
 
             if (!empty($query) && !isset($query['PatientID'])) {
-                $query['PatientID'] = '*';
-                $query['PatientName'] = '*';
+                $query['PatientID'] = '';
+                $query['PatientName'] = '';
             }
 
             if (!empty($query)) {
                 try {
                     if ($patientIdValue !== '') {
-                        $query['PatientName'] = '*';
+                        $query['PatientName'] = '';
                     }
                     // Para búsquedas solo por fecha, no agregar wildcards extra para evitar limitar resultados
 
@@ -687,6 +730,7 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
                                     }
                                 }
                             }
+                            unset($s); // Evitar bug de referencia en el último elemento
 
                             // Aplicar filtro de modalidades si seleccionado
                             if (!empty($selectedModalities)) {

@@ -259,31 +259,29 @@ function normalizeQueryContent(array $c): array
 {
     $tags = [];
     // StudyInstanceUID: buscar en varias claves (puede venir como '0020,000D' o StudyInstanceUID)
-    $tags['StudyInstanceUID'] = $c['StudyInstanceUID'] ?? $c['0020,000D'] ?? null;
+    $uidRaw = $c['StudyInstanceUID'] ?? $c['0020,000D'] ?? $c['0020,000d'] ?? null;
+    $tags['StudyInstanceUID'] = $uidRaw !== null ? extractTagValue($uidRaw) : null;
+
     // extraer StudyDate en múltiples formatos
     $sd = '';
-    if (isset($c['StudyDate']))
+    if (isset($c['StudyDate'])) {
         $sd = extractTagValue($c['StudyDate']);
-    if ($sd === '' && isset($c['0008,0020']))
+    }
+    if ($sd === '' && isset($c['0008,0020'])) {
         $sd = extractTagValue($c['0008,0020']);
+    }
     $tags['StudyDate'] = $sd ?: null;
 
-    // Patient / Nombre: buscar PatientName en varias formas
+    // PatientName
     $rawName = $c['PatientName'] ?? $c['0010,0010'] ?? $c['Patient'] ?? '';
-    if (is_array($rawName)) {
-        // intentamos normalizar estructuras complejas
-        if (isset($rawName['Alphabetic'])) {
-            $rawName = $rawName['Alphabetic'];
-        } else {
-            // usar extractTagValue para casos Orthanc
-            $rawName = extractTagValue($rawName);
-        }
-    }
-    $tags['PatientName'] = $rawName ?? '';
-    $tags['PatientID'] = $c['PatientID'] ?? $c['0010,0020'] ?? '';
+    $tags['PatientName'] = extractTagValue($rawName);
+
+    // PatientID
+    $tags['PatientID'] = extractTagValue($c['PatientID'] ?? $c['0010,0020'] ?? '');
 
     // Hora: preferir StudyTime, luego SeriesTime, AcquisitionTime
     $studyTime = $c['MainDicomTags']['StudyTime'] ?? $c['StudyTime'] ?? $c['SeriesTime'] ?? $c['AcquisitionTime'] ?? ($c['0008,0030'] ?? null) ?? '';
+    $studyTime = extractTagValue($studyTime);
     if (!empty($studyTime)) {
         $tags['StudyTime'] = $studyTime;
     }
@@ -300,7 +298,7 @@ function normalizeQueryContent(array $c): array
     }
 
     // Descripción: StudyDescription, SeriesDescription, ProtocolName
-    $tags['StudyDescription'] = extractTagValue($c['StudyDescription'] ?? ($c['SeriesDescription'] ?? ($c['ProtocolName'] ?? '')));
+    $tags['StudyDescription'] = extractTagValue($c['StudyDescription'] ?? $c['SeriesDescription'] ?? $c['ProtocolName'] ?? '');
 
     return $tags;
 }
@@ -906,24 +904,26 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
                 $query['Modality'] = $modalityValue;
             }
             // Always include Modality and StudyTime in the query to get them in the C-FIND response
-            $query['Modality'] = '*';
+            if (!isset($query['Modality'])) {
+                $query['Modality'] = '';
+            }
             $query['StudyTime'] = '';
             $query['StudyDescription'] = '';
 
             if ($forceRemote && empty($query)) {
-                $query['PatientID'] = '*';
-                $query['PatientName'] = '*';
+                $query['PatientID'] = '';
+                $query['PatientName'] = '';
             }
 
             if (!empty($query) && !isset($query['PatientID'])) {
-                $query['PatientID'] = '*';
-                $query['PatientName'] = '*';
+                $query['PatientID'] = '';
+                $query['PatientName'] = '';
             }
 
             if (!empty($query)) {
                 try {
                     if ($patientIdValue !== '') {
-                        $query['PatientName'] = '*';
+                        $query['PatientName'] = '';
                     }
                     // Para búsquedas solo por fecha, no agregar wildcards extra para evitar limitar resultados
 
@@ -1161,6 +1161,7 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
                                     }
                                 }
                             }
+                            unset($s); // Evitar bug de referencia en el último elemento
 
                             // Aplicar filtro de modalidades si seleccionado
                             if (!empty($selectedModalities)) {
