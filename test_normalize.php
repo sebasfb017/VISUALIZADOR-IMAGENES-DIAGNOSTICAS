@@ -1,5 +1,4 @@
 <?php
-// Simulate the core merging and filtering logic of remoto.php
 $ORTHANC_URL = 'http://192.168.52.155:8042';
 $MODALITY_ID = 'CANVAS';
 
@@ -20,9 +19,7 @@ function callOrthanc($method, $path, $body = null) {
     curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
     $response = curl_exec($ch);
     curl_close($ch);
-    $dec = json_decode($response, true);
-    if (json_last_error() !== JSON_ERROR_NONE) return null;
-    return $dec;
+    return json_decode($response, true);
 }
 
 function extractTagValue($v) {
@@ -72,43 +69,20 @@ function normalizeQueryContent(array $c): array {
     } else {
         $tags['ModalitiesInStudy'] = [];
     }
-    
-    $tags['StudyDescription'] = extractTagValue($c['StudyDescription'] ?? ($c['SeriesDescription'] ?? ($c['ProtocolName'] ?? '')));
     return $tags;
 }
 
-$patientIdValue = '38794415';
-
-// 1. LOCAL
-$body = ['Level' => 'Study', 'Expand' => true, 'Query' => ['PatientID' => $patientIdValue]];
-$localStudies = callOrthanc('POST', '/tools/find', $body) ?: [];
-
-$uniqueLocal = [];
-foreach ($localStudies as $st) {
-    $uid = $st['MainDicomTags']['StudyInstanceUID'] ?? null;
-    if ($uid && !isset($uniqueLocal[$uid])) $uniqueLocal[$uid] = $st;
-}
-$localStudies = array_values($uniqueLocal);
-$localStudyUids = [];
-$display = [];
-
-foreach ($localStudies as $st) {
-    $uid = $st['MainDicomTags']['StudyInstanceUID'] ?? null;
-    if ($uid) $localStudyUids[$uid] = true;
-    $item = $st;
-    $item['_local'] = true;
-    $display[] = $item;
-}
-
-// 2. REMOTE
-$query = ['PatientID' => $patientIdValue, 'Modality' => '', 'StudyTime' => '', 'StudyDescription' => '', 'PatientName' => ''];
-$resp = callOrthanc('POST', "/modalities/$MODALITY_ID/query", ['Level' => 'Study', 'Query' => $query]);
-$queryId = $resp['ID'] ?? null;
-
-if ($queryId) {
+try {
+    $patientIdValue = '38794415';
+    $query = ['PatientID' => $patientIdValue, 'Modality' => '', 'StudyDate' => '', 'StudyTime' => '', 'StudyDescription' => '', 'PatientName' => ''];
+    $body = ['Level' => 'Study', 'Query' => $query];
+    $resp = callOrthanc('POST', "/modalities/$MODALITY_ID/query", $body);
+    $queryId = $resp['ID'] ?? null;
+    
+    if (!$queryId) die("No query ID\n");
     sleep(1);
-    $answers = callOrthanc('GET', "/queries/$queryId/answers") ?: [];
-    $remoteStudyUids = [];
+
+    $answers = callOrthanc('GET', "/queries/$queryId/answers");
     foreach ($answers as $idx) {
         $content = callOrthanc('GET', "/queries/$queryId/answers/$idx/content?simplify");
         $normContent = $content;
@@ -118,21 +92,9 @@ if ($queryId) {
             $normContent = array_merge($mainTags, $patientTags);
         }
         $norm = normalizeQueryContent($normContent);
-        $remoteUid = $norm['StudyInstanceUID'] ?? null;
-        if ($remoteUid && !isset($localStudyUids[$remoteUid]) && !isset($remoteStudyUids[$remoteUid])) {
-            $remoteStudyUids[$remoteUid] = true;
-            $item = ['MainDicomTags' => $norm];
-            $item['_local'] = false;
-            $item['_remote'] = ['queryId' => $queryId, 'answerIdx' => $idx];
-            $display[] = $item;
-        } else {
-            echo "Skipped remote item idx $idx (UID=$remoteUid). Already in local? " . (isset($localStudyUids[$remoteUid]) ? 'YES' : 'NO') . " Already in remote? " . (isset($remoteStudyUids[$remoteUid]) ? 'YES' : 'NO') . "\n";
-        }
+        echo "Idx $idx => UID: " . ($norm['StudyInstanceUID'] ?: 'NULL') . " | Date: " . ($norm['StudyDate'] ?: 'NULL') . " | Mods: " . json_encode($norm['ModalitiesInStudy'] ?? []) . "\n";
     }
-}
 
-echo "\nFinal Display Items:\n";
-foreach ($display as $i => $s) {
-    $loc = $s['_local'] ? 'LOCAL' : 'REMOTE';
-    echo "[$i] $loc | UID=" . ($s['MainDicomTags']['StudyInstanceUID'] ?? '') . " | Date=" . ($s['MainDicomTags']['StudyDate'] ?? '') . " | Desc=" . ($s['MainDicomTags']['StudyDescription'] ?? '') . "\n";
+} catch (Exception $e) {
+    echo "Error: " . $e->getMessage() . "\n";
 }
