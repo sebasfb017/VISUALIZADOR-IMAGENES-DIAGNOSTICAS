@@ -140,7 +140,7 @@ function findStudiesInOrthancByPatientId(?string $patientId, int $maxTries = 1, 
     $body = [
         'Level'  => 'Study',
         'Expand' => true,
-        'Query'  => $query,
+        'Query'  => (object)$query,
     ];
 
     for ($i = 0; $i < $maxTries; $i++) {

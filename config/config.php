@@ -10,11 +10,11 @@
 $ENVIRONMENT = 'remote'; // Valores permitidos: 'local' (privada), 'remote' (pública)
 
 // Orthanc HTTP en el mismo equipo (o servidorPACS)
-$ORTHANC_URL = 'http://192.168.52.155:8042';
+$ORTHANC_URL = 'http://192.168.52.34:8042';
 
 // Configuración de la IP dinámica dependiendo del entorno
 if ($ENVIRONMENT === 'local') {
-    $OHIF_BASE_URL = 'http://192.168.52.155:8042'; // IP Privada local
+    $OHIF_BASE_URL = 'http://192.168.52.34:8042'; // IP Privada local
 } else {
     $OHIF_BASE_URL = 'http://181.56.10.196:8042';  // IP Pública / Remota
 }
