@@ -13,7 +13,7 @@ session_start();
  */
 
 // Orthanc HTTP en el mismo equipo
-$ORTHANC_URL = 'http://192.168.52.155:8042';
+$ORTHANC_URL = 'http://192.168.52.34:8042';
 
 // Alias de ClearCanvas en "DicomModalities" de Orthanc
 $MODALITY_ID = 'CANVAS';
@@ -54,7 +54,8 @@ $SHARE_SECRET = 'vsd_auth_premium_2026';
  */
 
 // Llamada genérica a la API REST de Orthanc (método central para toda comunicación)
-function callOrthanc($method, $path, $body = null)
+// $timeout: segundos máximos de espera (default 30). Usar valores más bajos para C-FIND remoto.
+function callOrthanc($method, $path, $body = null, $timeout = 30)
 {
     global $ORTHANC_URL;
 
@@ -63,7 +64,8 @@ function callOrthanc($method, $path, $body = null)
 
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 30); // Timeout de 30 segundos para evitar hangs largos
+    curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, min(5, $timeout)); // Conexión rápida o falla rápido
 
     $headers = ['Accept: application/json'];
 
@@ -206,7 +208,7 @@ function findStudiesInOrthancByPatientId(?string $patientId, int $maxTries = 1, 
     $body = [
         'Level' => 'Study',
         'Expand' => true,
-        'Query' => $query,
+        'Query' => (object) $query,
     ];
 
     for ($i = 0; $i < $maxTries; $i++) {
@@ -222,9 +224,23 @@ function findStudiesInOrthancByPatientId(?string $patientId, int $maxTries = 1, 
     return [];
 }
 
+// --- [CACHÉ EN MEMORIA] Almacén global para evitar llamadas repetidas a Orthanc
+// en el mismo request (problema N+1). Cada UID solo se consulta UNA VEZ por request.
+$_ORTHANC_STUDY_CACHE = [];
+
 // Obtiene los datos completos de un estudio en Orthanc por su DICOM StudyInstanceUID
+// Con caché en memoria: si ya lo consultamos en este request, se devuelve el resultado
+// guardado sin hacer otra petición HTTP a Orthanc.
 function getOrthancStudyFullData(string $studyUid): ?array
 {
+    global $_ORTHANC_STUDY_CACHE;
+
+    // Devolver desde caché si ya se consultó en este mismo request
+    if (array_key_exists($studyUid, $_ORTHANC_STUDY_CACHE)) {
+        return $_ORTHANC_STUDY_CACHE[$studyUid];
+    }
+
+    $result = null;
     try {
         // Orthanc requiere su propio ID interno (hash), no el DICOM UID, para rutas como /studies/.
         // Usamos /tools/lookup para encontrar el ID interno de Orthanc a partir del StudyInstanceUID.
@@ -236,7 +252,8 @@ function getOrthancStudyFullData(string $studyUid): ?array
                     $res = callOrthanc('GET', '/studies/' . urlencode($orthancId));
                     if (is_array($res) && isset($res['MainDicomTags'])) {
                         $res['ID'] = $orthancId; // Aseguramos que el ID de Orthanc esté disponible
-                        return $res;
+                        $result = $res;
+                        break;
                     }
                 }
             }
@@ -244,7 +261,10 @@ function getOrthancStudyFullData(string $studyUid): ?array
     } catch (Exception $e) {
         // estudio no existe o el PACS devolvió error de no encontrado
     }
-    return null;
+
+    // Guardar en caché (incluso null, para no volver a preguntar por estudios inexistentes)
+    $_ORTHANC_STUDY_CACHE[$studyUid] = $result;
+    return $result;
 }
 
 
@@ -252,6 +272,26 @@ function getOrthancStudyFullData(string $studyUid): ?array
 function orthancStudyExists(string $studyUid): bool
 {
     return getOrthancStudyFullData($studyUid) !== null;
+}
+
+// Limpia queries DICOM antiguas en Orthanc para evitar saturar el límite de memoria/almacenamiento (100)
+function cleanupStaleOrthancQueries(int $maxKeep = 25): void
+{
+    try {
+        $queries = callOrthanc('GET', '/queries');
+        if (is_array($queries) && count($queries) > $maxKeep) {
+            $toDelete = array_slice($queries, 0, count($queries) - $maxKeep);
+            foreach ($toDelete as $qid) {
+                try {
+                    callOrthanc('DELETE', '/queries/' . urlencode($qid));
+                } catch (Exception $e) {
+                    // ignorar fallos individuales
+                }
+            }
+        }
+    } catch (Exception $e) {
+        // ignorar si no se pueden listar queries
+    }
 }
 
 // Normaliza contenido simplificado de una respuesta de query a un set de MainDicomTags
@@ -262,13 +302,25 @@ function normalizeQueryContent(array $c): array
     $uidRaw = $c['StudyInstanceUID'] ?? $c['0020,000D'] ?? $c['0020,000d'] ?? null;
     $tags['StudyInstanceUID'] = $uidRaw !== null ? extractTagValue($uidRaw) : null;
 
-    // extraer StudyDate en múltiples formatos
+    // extraer StudyDate en múltiples formatos y tags equivalentes DICOM
     $sd = '';
     if (isset($c['StudyDate'])) {
         $sd = extractTagValue($c['StudyDate']);
     }
     if ($sd === '' && isset($c['0008,0020'])) {
         $sd = extractTagValue($c['0008,0020']);
+    }
+    if ($sd === '' && isset($c['SeriesDate'])) {
+        $sd = extractTagValue($c['SeriesDate']);
+    }
+    if ($sd === '' && isset($c['0008,0021'])) {
+        $sd = extractTagValue($c['0008,0021']);
+    }
+    if ($sd === '' && isset($c['AcquisitionDate'])) {
+        $sd = extractTagValue($c['AcquisitionDate']);
+    }
+    if ($sd === '' && isset($c['0008,0022'])) {
+        $sd = extractTagValue($c['0008,0022']);
     }
     $tags['StudyDate'] = $sd ?: null;
 
@@ -286,19 +338,25 @@ function normalizeQueryContent(array $c): array
         $tags['StudyTime'] = $studyTime;
     }
 
+    // Descripción: StudyDescription, SeriesDescription, ProtocolName
+    $tags['StudyDescription'] = extractTagValue($c['StudyDescription'] ?? $c['SeriesDescription'] ?? $c['ProtocolName'] ?? '');
+
     // Modalities: ModalitiesInStudy or Modality
     $mod = $c['MainDicomTags']['Modality'] ?? $c['Modality'] ?? '';
-    if (!empty($c['MainDicomTags']['ModalitiesInStudy'])) {
-        $tags['ModalitiesInStudy'] = $c['MainDicomTags']['ModalitiesInStudy'];
+    $modsInStudy = $c['MainDicomTags']['ModalitiesInStudy'] ?? $c['ModalitiesInStudy'] ?? null;
+    if (!empty($modsInStudy)) {
+        if (is_array($modsInStudy)) {
+            $tags['ModalitiesInStudy'] = $modsInStudy;
+        } else {
+            $tags['ModalitiesInStudy'] = array_values(array_filter(array_map('trim', explode('\\', (string)$modsInStudy))));
+        }
     } elseif (!empty($mod)) {
         $tags['ModalitiesInStudy'] = is_array($mod) ? $mod : [$mod];
         $tags['Modality'] = $mod;
     } else {
-        $tags['ModalitiesInStudy'] = [];
+        $inferred = getInferredModality($tags['StudyDescription']);
+        $tags['ModalitiesInStudy'] = $inferred ? [$inferred] : [];
     }
-
-    // Descripción: StudyDescription, SeriesDescription, ProtocolName
-    $tags['StudyDescription'] = extractTagValue($c['StudyDescription'] ?? $c['SeriesDescription'] ?? $c['ProtocolName'] ?? '');
 
     return $tags;
 }
@@ -372,7 +430,7 @@ function normalizeString($str)
 }
 
 // Llamada genérica que devuelve el contenido bruto (para imágenes/previews)
-function callOrthancRaw($method, $path, $body = null)
+function callOrthancRaw($method, $path, $body = null, array $customHeaders = [])
 {
     global $ORTHANC_URL;
 
@@ -383,7 +441,7 @@ function callOrthancRaw($method, $path, $body = null)
     curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
     curl_setopt($ch, CURLOPT_TIMEOUT, 60);
 
-    $headers = [];
+    $headers = $customHeaders;
     if ($body !== null) {
         $payload = json_encode($body);
         curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
@@ -694,6 +752,205 @@ if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 't
 }
 */
 
+// ============================================================================
+// ENDPOINTS AJAX: PRECARGA Y PROGRESO DE VISUALIZACIÓN EN SEGUNDO PLANO
+// ============================================================================
+
+// 1. Iniciar recuperación del estudio en segundo plano (para la ventana flotante)
+if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 'start_view_retrieve') {
+    header('Content-Type: application/json; charset=utf-8');
+    $studyUid = trim($_GET['study_uid'] ?? '');
+    if ($studyUid === '' || !preg_match('/^[0-9.]+$/', $studyUid)) {
+        echo json_encode(['status' => 'error', 'message' => 'StudyInstanceUID inválido']);
+        exit;
+    }
+
+    // Leer datos de sesión necesarios y liberar el lock inmediatamente
+    $lastQueryData = $_SESSION['last_query'] ?? null;
+    $viewJobs = $_SESSION['view_jobs'] ?? [];
+    session_write_close();
+
+    $ohifUrl = rtrim($OHIF_BASE_URL, '/') . rtrim($OHIF_VIEWER_PATH, '/') . urlencode($studyUid);
+
+    // Caso A: Ya existe en Orthanc localmente (listo para ver)
+    if (orthancStudyExists($studyUid)) {
+        echo json_encode([
+            'status' => 'ready',
+            'progress' => 100,
+            'message' => 'Estudio listo en PACS local.',
+            'ohifUrl' => $ohifUrl
+        ]);
+        exit;
+    }
+
+    // Caso B: Estudio remoto, disparar C-MOVE desde ClearCanvas
+    $queryId = trim($_GET['query_id'] ?? '');
+    if ($queryId === '') {
+        $queryId = $lastQueryData['id'] ?? '';
+    }
+    $answerIdx = trim($_GET['answer_idx'] ?? '');
+
+    try {
+        $resolvedQueryId = null;
+        $resolvedAnswerIdx = null;
+
+        if ($queryId !== '' && $answerIdx !== '') {
+            try {
+                $testAnswers = callOrthanc('GET', "/queries/" . urlencode($queryId) . "/answers");
+                if (is_array($testAnswers) && in_array($answerIdx, $testAnswers)) {
+                    $resolvedQueryId = $queryId;
+                    $resolvedAnswerIdx = $answerIdx;
+                }
+            } catch (Exception $e) {
+                $resolvedQueryId = null;
+            }
+        }
+
+        // Si la query expiró o no la tenemos, recrearla
+        if (!$resolvedQueryId || !$resolvedAnswerIdx) {
+            $body = $lastQueryData['body'] ?? ['StudyInstanceUID' => $studyUid];
+            $newResp = callOrthanc('POST', "/modalities/$MODALITY_ID/query", [
+                'Level' => 'Study',
+                'Query' => $body
+            ]);
+            $resolvedQueryId = $newResp['ID'] ?? null;
+            if (!$resolvedQueryId) {
+                throw new Exception('No se pudo consultar ClearCanvas.');
+            }
+            $answers = callOrthanc('GET', "/queries/$resolvedQueryId/answers");
+            foreach ($answers as $idx) {
+                $content = callOrthanc('GET', "/queries/$resolvedQueryId/answers/$idx/content?simplify");
+                $norm = normalizeQueryContent(is_array($content) ? $content : []);
+                if (($norm['StudyInstanceUID'] ?? '') === $studyUid) {
+                    $resolvedAnswerIdx = $idx;
+                    break;
+                }
+            }
+            if (!$resolvedAnswerIdx) {
+                throw new Exception('No se encontró el estudio en ClearCanvas.');
+            }
+        }
+
+        // Iniciar C-MOVE en Orthanc
+        $retrieveResp = callOrthanc('POST', "/queries/$resolvedQueryId/answers/$resolvedAnswerIdx/retrieve", $ORTHANC_AET);
+        $jobId = $retrieveResp['ID'] ?? null;
+
+        session_start();
+        if (!isset($_SESSION['view_jobs'])) {
+            $_SESSION['view_jobs'] = [];
+        }
+        $_SESSION['view_jobs'][$studyUid] = [
+            'jobId' => $jobId,
+            'started' => time(),
+            'queryId' => $resolvedQueryId,
+            'answerIdx' => $resolvedAnswerIdx
+        ];
+        session_write_close();
+
+        echo json_encode([
+            'status' => 'pending',
+            'jobId' => $jobId,
+            'progress' => 15,
+            'message' => 'Transferencia iniciada en segundo plano...',
+            'ohifUrl' => $ohifUrl
+        ]);
+        exit;
+    } catch (Exception $e) {
+        echo json_encode([
+            'status' => 'error',
+            'message' => 'Error al iniciar recuperación: ' . $e->getMessage()
+        ]);
+        exit;
+    }
+}
+
+// 2. Consultar progreso en tiempo real de la transferencia del estudio
+if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 'check_view_job') {
+    session_write_close(); // El polling no debe bloquear la sesión de PHP
+    header('Content-Type: application/json; charset=utf-8');
+    $studyUid = trim($_GET['study_uid'] ?? '');
+    $jobId = trim($_GET['job_id'] ?? '');
+
+    if ($studyUid === '' || !preg_match('/^[0-9.]+$/', $studyUid)) {
+        echo json_encode(['status' => 'error', 'message' => 'StudyInstanceUID inválido']);
+        exit;
+    }
+
+    $ohifUrl = rtrim($OHIF_BASE_URL, '/') . rtrim($OHIF_VIEWER_PATH, '/') . urlencode($studyUid);
+    $isLocal = orthancStudyExists($studyUid);
+
+    if ($jobId !== '') {
+        try {
+            $job = callOrthanc('GET', '/jobs/' . urlencode($jobId));
+            $state = $job['State'] ?? '';
+            $progress = intval($job['Progress'] ?? 0);
+
+            if ($state === 'Success') {
+                echo json_encode([
+                    'status' => 'ready',
+                    'progress' => 100,
+                    'message' => '¡Estudio cargado al 100%! Abriendo visor...',
+                    'ohifUrl' => $ohifUrl
+                ]);
+                exit;
+            } elseif ($state === 'Failure') {
+                if ($isLocal) {
+                    echo json_encode([
+                        'status' => 'ready',
+                        'progress' => 100,
+                        'message' => 'Estudio disponible en PACS local. Abriendo visor...',
+                        'ohifUrl' => $ohifUrl
+                    ]);
+                    exit;
+                }
+                echo json_encode([
+                    'status' => 'error',
+                    'progress' => 0,
+                    'message' => 'La transferencia falló en ClearCanvas: ' . ($job['ErrorDescription'] ?? 'Error desconocido')
+                ]);
+                exit;
+            } else {
+                $calcPct = max(20, min(95, $progress));
+                echo json_encode([
+                    'status' => 'pending',
+                    'progress' => $calcPct,
+                    'message' => 'Transfiriendo imágenes DICOM al PACS local (' . $calcPct . '%)...',
+                    'ohifUrl' => $ohifUrl
+                ]);
+                exit;
+            }
+        } catch (Exception $e) {
+            if ($isLocal) {
+                echo json_encode([
+                    'status' => 'ready',
+                    'progress' => 100,
+                    'message' => 'Estudio listo en PACS local.',
+                    'ohifUrl' => $ohifUrl
+                ]);
+                exit;
+            }
+        }
+    }
+
+    if ($isLocal) {
+        echo json_encode([
+            'status' => 'ready',
+            'progress' => 100,
+            'message' => 'Estudio listo en PACS local.',
+            'ohifUrl' => $ohifUrl
+        ]);
+        exit;
+    }
+
+    echo json_encode([
+        'status' => 'pending',
+        'progress' => 35,
+        'message' => 'Esperando recepción de imágenes en Orthanc...',
+        'ohifUrl' => $ohifUrl
+    ]);
+    exit;
+}
+
 $isSharedAccess = false;
 if (isset($_GET['action']) && $_GET['action'] === 'view_shared') {
     $uid = trim($_GET['study_uid'] ?? '');
@@ -728,51 +985,85 @@ if ((isset($_SESSION['user']) || $isSharedAccess) && isset($_GET['action']) && (
     } else {
         try {
             $doRetrieve = false;
+
+            // Construir URL del visor OHIF
+            $ohifUrl = rtrim($OHIF_BASE_URL, '/') . rtrim($OHIF_VIEWER_PATH, '/') . urlencode($studyUid);
+
             if ($queryId !== '') {
+                // --- [MEJORA RENDIMIENTO] Estudio REMOTO (viene de ClearCanvas) ---
+                // Si el estudio ya llegó a Orthanc (porque el médico ya lo había visto antes),
+                // ir directo al visor sin C-MOVE innecesario.
+                if (orthancStudyExists($studyUid)) {
+                    debug_log("view: study $studyUid already in Orthanc, skipping C-MOVE, opening OHIF directly");
+                    header('Location: ' . $ohifUrl);
+                    exit;
+                }
+
                 $doRetrieve = true;
-                // Estudio remoto: recrear la query siempre para evitar expiración
-                $body = isset($_SESSION['last_query']['body']) ? $_SESSION['last_query']['body'] : null;
-                if (!$body || !is_array($body)) {
-                    throw new Exception('No hay información de búsqueda guardada para recrear la query.');
-                }
 
-                $newResp = callOrthanc('POST', "/modalities/$MODALITY_ID/query", [
-                    'Level' => 'Study',
-                    'Query' => $body
-                ]);
-                $resolvedQueryId = $newResp['ID'] ?? null;
-                if (!$resolvedQueryId) {
-                    throw new Exception('No se pudo recrear la query en ClearCanvas.');
-                }
-
-                // Encontrar el answerIdx para este studyUid
-                $answers = callOrthanc('GET', "/queries/$resolvedQueryId/answers");
-                $resolvedAnswerIdx = '';
-                foreach ($answers as $idx) {
-                    $content = callOrthanc('GET', "/queries/$resolvedQueryId/answers/$idx/content?simplify");
-                    $norm = normalizeQueryContent(is_array($content) ? $content : []);
-                    $remoteUidNorm = $norm['StudyInstanceUID'] ?? null;
-                    if ($remoteUidNorm === $studyUid) {
-                        $resolvedAnswerIdx = $idx;
-                        break;
+                // --- [MEJORA RENDIMIENTO] Usar el answerIdx que ya viene en la URL
+                // (guardado en la tabla de resultados) para evitar re-query completa a ClearCanvas.
+                // Solo recreamos la query si NO tenemos el answerIdx disponible.
+                if ($answerIdx !== '') {
+                    // Camino rápido: answerIdx ya conocido, usar queryId de la URL directamente
+                    // Verificar que la query sigue viva en Orthanc
+                    try {
+                        $testAnswers = callOrthanc('GET', "/queries/$queryId/answers");
+                        $resolvedQueryId = $queryId;
+                        $resolvedAnswerIdx = $answerIdx;
+                        debug_log("view: using existing queryId=$queryId answerIdx=$answerIdx (fast path)");
+                    } catch (Exception $e) {
+                        // La query expiró, necesitamos recrearla
+                        $resolvedQueryId = null;
+                        debug_log("view: query $queryId expired, will recreate. Error: " . $e->getMessage());
                     }
                 }
 
-                if ($resolvedAnswerIdx === '') {
-                    throw new Exception('No se encontró el estudio en la query recreada.');
+                // Camino lento: recrear la query (query expirada o no tenemos answerIdx)
+                if (empty($resolvedQueryId)) {
+                    $body = isset($_SESSION['last_query']['body']) ? $_SESSION['last_query']['body'] : null;
+
+                    // Si no hay body en sesión, intentar buscar solo por StudyInstanceUID
+                    if (!$body || !is_array($body)) {
+                        $body = ['StudyInstanceUID' => $studyUid];
+                    }
+
+                    $newResp = callOrthanc('POST', "/modalities/$MODALITY_ID/query", [
+                        'Level' => 'Study',
+                        'Query' => $body
+                    ]);
+                    $resolvedQueryId = $newResp['ID'] ?? null;
+                    if (!$resolvedQueryId) {
+                        throw new Exception('No se pudo recrear la query en ClearCanvas.');
+                    }
+
+                    // Encontrar el answerIdx para este studyUid
+                    $answers = callOrthanc('GET', "/queries/$resolvedQueryId/answers");
+                    $resolvedAnswerIdx = '';
+                    foreach ($answers as $idx) {
+                        $content = callOrthanc('GET', "/queries/$resolvedQueryId/answers/$idx/content?simplify");
+                        $norm = normalizeQueryContent(is_array($content) ? $content : []);
+                        $remoteUidNorm = $norm['StudyInstanceUID'] ?? null;
+                        if ($remoteUidNorm === $studyUid) {
+                            $resolvedAnswerIdx = $idx;
+                            break;
+                        }
+                    }
+
+                    if ($resolvedAnswerIdx === '') {
+                        throw new Exception('No se encontró el estudio en ClearCanvas. Verifica la conexión con la modalidad.');
+                    }
+                    debug_log("view: recreated query resolvedQueryId=$resolvedQueryId answerIdx=$resolvedAnswerIdx");
                 }
 
-                $debugDetails = 'Recreando query y enviando C-MOVE para el estudio ' . $studyUid . ' a la modalidad ' . $MODALITY_ID . ' con TargetAet ' . $ORTHANC_AET . '. nuevo queryId=' . $resolvedQueryId . ' answerIdx=' . $resolvedAnswerIdx;
+                $debugDetails = 'Enviando C-MOVE para ' . $studyUid . ' vía ' . $MODALITY_ID . ' → ' . $ORTHANC_AET . '. queryId=' . $resolvedQueryId . ' answerIdx=' . $resolvedAnswerIdx;
             }
 
-            // Abrir OHIF
-            $ohifUrl = rtrim($OHIF_BASE_URL, '/') . rtrim($OHIF_VIEWER_PATH, '/') . urlencode($studyUid);
-            
             if (!$doRetrieve) {
+                // Estudio LOCAL: ir directo al visor
                 header('Location: ' . $ohifUrl);
                 exit;
             }
-            $waitTime = 0; // Se esperará el retrieve antes de mostrar la página
             $loading = true;
         } catch (Exception $e) {
             $status = 'error';
@@ -793,24 +1084,26 @@ if ((isset($_SESSION['user']) || $isSharedAccess) && isset($_GET['action']) && (
  */
 if ($doRetrieve && isset($loading)) {
     try {
-        // Hacer retrieve y redirigir a página de espera en lugar de bloquear
-        $retrieveResp = callOrthanc('POST', "/queries/$resolvedQueryId/answers/$resolvedAnswerIdx/retrieve", [
-            'TargetAet' => $ORTHANC_AET
-        ]);
-        if (isset($retrieveResp['ID'])) {
-            $jobId = $retrieveResp['ID'];
-            // Guardar jobId en sesión para polling
+        // --- [MEJORA RENDIMIENTO] Disparar C-MOVE y redirigir INMEDIATAMENTE al visor
+        // sin bloquear al médico. OHIF mostrará las imágenes a medida que lleguen
+        // gracias al mecanismo WADOrs/DICOMweb de Orthanc (carga progresiva).
+        $retrieveResp = callOrthanc('POST', "/queries/$resolvedQueryId/answers/$resolvedAnswerIdx/retrieve", $ORTHANC_AET);
+        $jobId = $retrieveResp['ID'] ?? null;
+
+        // Guardar info del job en sesión para monitoreo opcional posterior
+        if ($jobId) {
             $_SESSION['retrieve_job'] = $jobId;
-            $_SESSION['ohif_url'] = $ohifUrl;
-            // Redirigir a página de espera
-            header('Location: wait.php?job=' . $jobId);
-            exit;
-        } else {
-            // Si no hay ID de job, esperar 5 segundos como antes y luego redirigir
-            sleep(5);
-            header('Location: ' . $ohifUrl);
-            exit;
         }
+        $_SESSION['ohif_url'] = $ohifUrl;
+
+        // --- REDIRIGIR INMEDIATAMENTE AL VISOR OHIF ---
+        // OHIF carga estudios DICOM de forma progresiva (imagen por imagen),
+        // por lo que el médico comienza a ver las primeras imágenes en segundos,
+        // mientras el retrieve sigue trayendo el resto en segundo plano.
+        // Ya no hay sleep(5) ni wait.php — tiempo de espera del médico = ~0s.
+        header('Location: ' . $ohifUrl);
+        exit;
+
     } catch (Exception $e) {
         $status = 'error';
         $message = 'Error al recuperar el estudio: ' . $e->getMessage();
@@ -830,410 +1123,443 @@ if ($doRetrieve && isset($loading)) {
  *    los remotos se entiendan como "por importar".
  */
 if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['patient_id'])) {
-    // Agregar query a la lista activa
-    $_SESSION['active_queries'][] = time();
-
-    // Limpiar búsquedas previas en sesión
-    unset($_SESSION['last_query'], $_SESSION['last_search_results']);
-
     $patientIdValue = trim($_GET['patient_id'] ?? '');
     $dateFromValue = trim($_GET['date_from'] ?? '');
     $dateToValue = trim($_GET['date_to'] ?? '');
 
+    $currentQueryHash = md5($patientIdValue . '|' . $dateFromValue . '|' . $dateToValue);
+
+    // Agregar query a la lista activa
+    $_SESSION['active_queries'][] = time();
+
+    // Limpiar búsquedas previas solo si los filtros cambiaron (evita recargar todo en la paginación)
+    if (!isset($_SESSION['last_query']) || $_SESSION['last_query'] !== $currentQueryHash) {
+        unset($_SESSION['last_search_results']);
+        $_SESSION['last_query'] = $currentQueryHash;
+    }
+
+    // --- [OPTIMIZACIÓN] session_write_close() para concurrencia multi-tab / multi-usuario ---
+    // Leer todos los datos de sesión que necesitamos ANTES de cerrar la escritura.
+    // Esto libera el lock del archivo de sesión, permitiendo que otras peticiones
+    // del mismo usuario (otras pestañas) no queden bloqueadas esperando.
+    $cachedSearchResults = $_SESSION['last_search_results'] ?? null;
+    $cachedLastQuery = $_SESSION['last_query_data'] ?? null;
+    $sessionUser = $_SESSION['user'] ?? null;
+    $sessionActiveQueries = $_SESSION['active_queries'] ?? [];
+    session_write_close(); // <-- Libera el lock de sesión
+
     // --- [MODIFICACIÓN] 2. Sanitizado de Formato de Entrada de Fechas ---
     // Filtra las fechas recibidas por URL para que sean un string seguro de formato 'YYYY-MM-DD'
-    if ($dateFromValue !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateFromValue)) {
-        $dateFromValue = '';
+    if ($dateFromValue !== '') {
+        if (preg_match('/^(\d{2})\/(\d{2})\/(\d{4})$/', $dateFromValue, $matches)) {
+            $dateFromValue = $matches[3] . '-' . $matches[2] . '-' . $matches[1];
+        } elseif (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateFromValue)) {
+            $dateFromValue = '';
+        }
     }
-    if ($dateToValue !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateToValue)) {
-        $dateToValue = '';
+    if ($dateToValue !== '') {
+        if (preg_match('/^(\d{2})\/(\d{2})\/(\d{4})$/', $dateToValue, $matches)) {
+            $dateToValue = $matches[3] . '-' . $matches[2] . '-' . $matches[1];
+        } elseif (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateToValue)) {
+            $dateToValue = '';
+        }
     }
 
-    // Requerimos al menos un criterio: PatientID o un rango de fechas
-    // Removido para permitir búsqueda de todos los estudios
-    // if ($patientIdValue === '' && $dateFromValue === '' && $dateToValue === '') {
-    //     $status  = 'error';
-    //     $message = 'Debes escribir un ID de paciente o indicar un rango de fechas.';
-    // } else {
-    $dateFrom = $dateFromValue !== '' ? $dateFromValue : null;
-    $dateTo = $dateToValue !== '' ? $dateToValue : null;
-
-    // Validar que la fecha desde no sea posterior a la fecha hasta
-    if ($dateFrom && $dateTo && $dateFrom > $dateTo) {
+    // Prevención de búsqueda masiva: si la fecha se invalidó y no hay paciente, abortar
+    if ($patientIdValue === '' && $dateFromValue === '' && $dateToValue === '') {
         $status = 'error';
-        $message = 'La fecha "desde" no puede ser posterior a la fecha "hasta".';
+        $message = 'Debes escribir un ID de paciente o indicar un rango de fechas válido.';
+        $studies = [];
+        $display = [];
     } else {
-        try {
-            $dateRange = buildDicomDateRange($dateFrom, $dateTo);
+        $dateFrom = $dateFromValue !== '' ? $dateFromValue : null;
+        $dateTo = $dateToValue !== '' ? $dateToValue : null;
 
-            $forceRemote = true;
+        // Validar que la fecha desde no sea posterior a la fecha hasta
+        if ($dateFrom && $dateTo && $dateFrom > $dateTo) {
+            $status = 'error';
+            $message = 'La fecha "desde" no puede ser posterior a la fecha "hasta".';
+        } else {
+            try {
+                if ($cachedSearchResults !== null) {
+                    // Ya tenemos los resultados exactos para estos filtros, recuperamos de caché
+                    $display = $cachedSearchResults;
+                    $studies = $display;
+                    $localCount = count(array_filter($display, fn($s) => isset($s['_local']) && $s['_local']));
+                    $remoteCount = count($display) - $localCount;
+                    $status = 'ok';
+                    $filterMsg = !empty($selectedModalities) ? ' Filtro aplicado.' : '';
+                    $message = 'Listado generado (' . $localCount . ' locales, ' . $remoteCount . ' remotos). Pulsa "Cargar y ver" para traer un estudio desde Canvas cuando lo necesites.' . $filterMsg;
+                } else {
+                    $dateRange = buildDicomDateRange($dateFrom, $dateTo);
 
-            // 1) Estudios ya existentes en Orthanc
-            $localStudies = findStudiesInOrthancByPatientId($patientIdValue !== '' ? $patientIdValue : null, 1, 0, $dateFrom, $dateTo);
-            // Deduplicar estudios locales por StudyInstanceUID
-            $uniqueLocal = [];
-            foreach ($localStudies as $st) {
-                $uid = $st['MainDicomTags']['StudyInstanceUID'] ?? null;
-                if ($uid && !isset($uniqueLocal[$uid])) {
-                    $uniqueLocal[$uid] = $st;
-                }
-            }
-            $localStudies = array_values($uniqueLocal);
-            $localStudyUids = [];
-            $display = [];
+                    $forceRemote = true;
 
-            foreach ($localStudies as $st) {
-                $uid = $st['MainDicomTags']['StudyInstanceUID'] ?? null;
-                if ($uid) {
-                    $localStudyUids[$uid] = true;
-                }
-                $item = $st;
-                $item['_local'] = true;
-                $display[] = $item;
-            }
+                    // 1) Estudios ya existentes en Orthanc
+                    $localStudies = findStudiesInOrthancByPatientId($patientIdValue !== '' ? $patientIdValue : null, 1, 0, $dateFrom, $dateTo);
+                    // Deduplicar estudios locales por StudyInstanceUID
+                    $uniqueLocal = [];
+                    foreach ($localStudies as $st) {
+                        $uid = $st['MainDicomTags']['StudyInstanceUID'] ?? null;
+                        if ($uid && !isset($uniqueLocal[$uid])) {
+                            $uniqueLocal[$uid] = $st;
+                        }
+                    }
+                    $localStudies = array_values($uniqueLocal);
+                    $localStudyUids = [];
+                    $display = [];
 
-            // 2) C-FIND en Canvas (listado) si es posible
-            $query = [];
-            if ($patientIdValue !== '') {
-                $query['PatientID'] = $patientIdValue;
-            }
-            if ($dateRange) {
-                $query['StudyDate'] = $dateRange;
-            }
-            if (!empty($modalityValue)) {
-                $query['Modality'] = $modalityValue;
-            }
-            // Always include Modality and StudyTime in the query to get them in the C-FIND response
-            if (!isset($query['Modality'])) {
-                $query['Modality'] = '';
-            }
-            $query['StudyTime'] = '';
-            $query['StudyDescription'] = '';
+                    foreach ($localStudies as $st) {
+                        $uid = $st['MainDicomTags']['StudyInstanceUID'] ?? null;
+                        if ($uid) {
+                            $localStudyUids[$uid] = true;
+                        }
+                        $item = $st;
+                        $item['_local'] = true;
+                        $display[] = $item;
+                    }
 
-            if ($forceRemote && empty($query)) {
-                $query['PatientID'] = '';
-                $query['PatientName'] = '';
-            }
-
-            if (!empty($query) && !isset($query['PatientID'])) {
-                $query['PatientID'] = '';
-                $query['PatientName'] = '';
-            }
-
-            if (!empty($query)) {
-                try {
+                    // 2) C-FIND en Canvas (listado) si es posible
+                    $query = [];
                     if ($patientIdValue !== '') {
+                        $query['PatientID'] = $patientIdValue;
+                    }
+                    if ($dateRange) {
+                        $query['StudyDate'] = $dateRange;
+                    }
+                    if (!empty($modalityValue)) {
+                        $query['Modality'] = $modalityValue;
+                    }
+                    // IMPORTANTE: Asegurar que StudyDate y ModalitiesInStudy siempre estén presentes en la consulta C-FIND
+                    // incluso si no se filtró por fecha, para que ClearCanvas los devuelva de inmediato a nivel de estudio.
+                    if (!isset($query['StudyDate'])) {
+                        $query['StudyDate'] = '';
+                    }
+                    if (!isset($query['ModalitiesInStudy'])) {
+                        $query['ModalitiesInStudy'] = '';
+                    }
+                    if (!isset($query['Modality'])) {
+                        $query['Modality'] = '';
+                    }
+                    $query['StudyTime'] = '';
+                    $query['StudyDescription'] = '';
+                    $query['AccessionNumber'] = '';
+
+                    if ($forceRemote && empty($query)) {
+                        $query['PatientID'] = '';
                         $query['PatientName'] = '';
                     }
-                    // Para búsquedas solo por fecha, no agregar wildcards extra para evitar limitar resultados
 
-                    // Comprobación de conectividad y existencia de la modalidad en Orthanc
-                    try {
-                        $cacheFile = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'orthanc_modalities.json';
-                        if (file_exists($cacheFile) && (time() - filemtime($cacheFile)) < 3600) {
-                            $modalitiesList = json_decode(file_get_contents($cacheFile), true);
-                        } else {
-                            $modalitiesList = callOrthanc('GET', '/modalities');
-                            if ($modalitiesList)
-                                file_put_contents($cacheFile, json_encode($modalitiesList));
-                        }
-                        $foundModality = false;
-                        if (is_array($modalitiesList)) {
-                            // Caso A: array asociativo indexado por ID
-                            if (isset($modalitiesList[$MODALITY_ID])) {
-                                $foundModality = true;
-                            } else {
-                                // Caso B: lista indexada o estructura con objetos/valores
-                                foreach ($modalitiesList as $k => $v) {
-                                    // clave igual a MODALITY_ID
-                                    if (strtoupper((string) $k) === strtoupper($MODALITY_ID)) {
-                                        $foundModality = true;
-                                        break;
-                                    }
-
-                                    // valor simple igual a MODALITY_ID
-                                    if (is_string($v) && strtoupper($v) === strtoupper($MODALITY_ID)) {
-                                        $foundModality = true;
-                                        break;
-                                    }
-
-                                    // valor array/obj con campo ID o Name
-                                    if (is_array($v)) {
-                                        if ((isset($v['ID']) && strtoupper((string) $v['ID']) === strtoupper($MODALITY_ID)) || (isset($v['Name']) && strtoupper((string) $v['Name']) === strtoupper($MODALITY_ID))) {
-                                            $foundModality = true;
-                                            break;
-                                        }
-                                    } elseif (is_object($v)) {
-                                        $obj = (array) $v;
-                                        if ((isset($obj['ID']) && strtoupper((string) $obj['ID']) === strtoupper($MODALITY_ID)) || (isset($obj['Name']) && strtoupper((string) $obj['Name']) === strtoupper($MODALITY_ID))) {
-                                            $foundModality = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        } elseif (is_string($modalitiesList)) {
-                            // Caso C: respuesta simple como string (ej. "CANVAS" o lista separada)
-                            if (strtoupper($modalitiesList) === strtoupper($MODALITY_ID)) {
-                                $foundModality = true;
-                            } elseif (strpos($modalitiesList, ',') !== false) {
-                                // Si es una lista separada por comas
-                                $mods = explode(',', $modalitiesList);
-                                foreach ($mods as $mod) {
-                                    if (strtoupper(trim($mod)) === strtoupper($MODALITY_ID)) {
-                                        $foundModality = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if (!$foundModality) {
-                            $debugDetails = 'Respuesta /modalities: ' . json_encode($modalitiesList);
-                            throw new Exception('Modalidad "' . $MODALITY_ID . '" no encontrada en Orthanc. Revisa orthanc.json (DicomModalities) y la conexión con ClearCanvas.');
-                        }
-                    } catch (Exception $e) {
-                        // si ya hay debugDetails lo conservamos
-                        if (empty($debugDetails))
-                            $debugDetails = $e->getMessage();
-                        throw new Exception('No se pudo conectar a Orthanc/Canvas: ' . $e->getMessage());
+                    if (!empty($query) && !isset($query['PatientID'])) {
+                        $query['PatientID'] = '';
+                        $query['PatientName'] = '';
                     }
 
-                    $queryResponse = callOrthanc('POST', "/modalities/$MODALITY_ID/query", [
-                        'Level' => 'Study',
-                        'Query' => $query
-                    ]);
-
-                    $queryId = $queryResponse['ID'] ?? null;
-                    if ($queryId) {
-                        $_SESSION['last_query'] = ['id' => $queryId, 'when' => time(), 'body' => $query];
-                    }
-                    // Si la búsqueda fue por PatientID, intentar obtener PatientName a nivel Patient
-                    $globalPatientName = '';
-                    if ($patientIdValue !== '') {
+                    if (!empty($query)) {
                         try {
-                            $patientQuery = ['PatientID' => $patientIdValue, 'PatientName' => '*'];
-                            $patientQueryResp = callOrthanc('POST', "/modalities/$MODALITY_ID/query", [
-                                'Level' => 'Patient',
-                                'Query' => $patientQuery
-                            ]);
-                            $patientQueryId = $patientQueryResp['ID'] ?? null;
-                            if ($patientQueryId) {
-                                $patientAnswers = callOrthanc('GET', "/queries/$patientQueryId/answers");
-                                if (!empty($patientAnswers) && is_array($patientAnswers)) {
-                                    // tomar el primer resultado
-                                    $first = reset($patientAnswers);
-                                    $patientContent = callOrthanc('GET', "/queries/$patientQueryId/answers/$first/content?simplify");
-                                    if (is_array($patientContent)) {
-                                        $patientTags = $patientContent['PatientMainDicomTags'] ?? $patientContent['MainDicomTags'] ?? $patientContent;
-                                        $globalPatientName = $patientTags['PatientName'] ?? $patientTags['0010,0010'] ?? '';
-                                        if (is_array($globalPatientName)) {
-                                            if (isset($globalPatientName['Alphabetic'])) {
-                                                $globalPatientName = (string) $globalPatientName['Alphabetic'];
+                            if ($patientIdValue !== '') {
+                                $query['PatientName'] = '';
+                            }
+                            // Para búsquedas solo por fecha, no agregar wildcards extra para evitar limitar resultados
+
+                            // Comprobación de conectividad y existencia de la modalidad en Orthanc
+                            try {
+                                $cacheFile = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'orthanc_modalities.json';
+                                if (file_exists($cacheFile) && (time() - filemtime($cacheFile)) < 3600) {
+                                    $modalitiesList = json_decode(file_get_contents($cacheFile), true);
+                                } else {
+                                    $modalitiesList = callOrthanc('GET', '/modalities');
+                                    if ($modalitiesList)
+                                        file_put_contents($cacheFile, json_encode($modalitiesList));
+                                }
+                                $foundModality = false;
+                                if (is_array($modalitiesList)) {
+                                    // Caso A: array asociativo indexado por ID
+                                    if (isset($modalitiesList[$MODALITY_ID])) {
+                                        $foundModality = true;
+                                    } else {
+                                        // Caso B: lista indexada o estructura con objetos/valores
+                                        foreach ($modalitiesList as $k => $v) {
+                                            // clave igual a MODALITY_ID
+                                            if (strtoupper((string) $k) === strtoupper($MODALITY_ID)) {
+                                                $foundModality = true;
+                                                break;
+                                            }
+
+                                            // valor simple igual a MODALITY_ID
+                                            if (is_string($v) && strtoupper($v) === strtoupper($MODALITY_ID)) {
+                                                $foundModality = true;
+                                                break;
+                                            }
+
+                                            // valor array/obj con campo ID o Name
+                                            if (is_array($v)) {
+                                                if ((isset($v['ID']) && strtoupper((string) $v['ID']) === strtoupper($MODALITY_ID)) || (isset($v['Name']) && strtoupper((string) $v['Name']) === strtoupper($MODALITY_ID))) {
+                                                    $foundModality = true;
+                                                    break;
+                                                }
+                                            } elseif (is_object($v)) {
+                                                $obj = (array) $v;
+                                                if ((isset($obj['ID']) && strtoupper((string) $obj['ID']) === strtoupper($MODALITY_ID)) || (isset($obj['Name']) && strtoupper((string) $obj['Name']) === strtoupper($MODALITY_ID))) {
+                                                    $foundModality = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                } elseif (is_string($modalitiesList)) {
+                                    // Caso C: respuesta simple como string (ej. "CANVAS" o lista separada)
+                                    if (strtoupper($modalitiesList) === strtoupper($MODALITY_ID)) {
+                                        $foundModality = true;
+                                    } elseif (strpos($modalitiesList, ',') !== false) {
+                                        // Si es una lista separada por comas
+                                        $mods = explode(',', $modalitiesList);
+                                        foreach ($mods as $mod) {
+                                            if (strtoupper(trim($mod)) === strtoupper($MODALITY_ID)) {
+                                                $foundModality = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (!$foundModality) {
+                                    $debugDetails = 'Respuesta /modalities: ' . json_encode($modalitiesList);
+                                    throw new Exception('Modalidad "' . $MODALITY_ID . '" no encontrada en Orthanc. Revisa orthanc.json (DicomModalities) y la conexión con ClearCanvas.');
+                                }
+                            } catch (Exception $e) {
+                                // si ya hay debugDetails lo conservamos
+                                if (empty($debugDetails))
+                                    $debugDetails = $e->getMessage();
+                                throw new Exception('No se pudo conectar a Orthanc/Canvas: ' . $e->getMessage());
+                            }
+
+                            // Limpieza automática preventiva de consultas antiguas en Orthanc para mantener memoria liberada
+                            cleanupStaleOrthancQueries(25);
+
+                            // --- [OPTIMIZACIÓN] Timeout reducido para C-FIND remoto ---
+                            // ClearCanvas normalmente responde en < 2s. Con 10s de timeout,
+                            // si está caído o lento no bloquea al usuario 30 segundos.
+                            $queryResponse = callOrthanc('POST', "/modalities/$MODALITY_ID/query", [
+                                'Level' => 'Study',
+                                'Query' => $query
+                            ], 10);
+
+                            $queryId = $queryResponse['ID'] ?? null;
+                            if ($queryId) {
+                                $_SESSION['last_query'] = ['id' => $queryId, 'when' => time(), 'body' => $query];
+                            }
+                            // Si la búsqueda fue por PatientID, intentar obtener PatientName a nivel Patient
+                            $globalPatientName = '';
+                            if ($patientIdValue !== '') {
+                                try {
+                                    $patientQuery = ['PatientID' => $patientIdValue, 'PatientName' => '*'];
+                                    $patientQueryResp = callOrthanc('POST', "/modalities/$MODALITY_ID/query", [
+                                        'Level' => 'Patient',
+                                        'Query' => $patientQuery
+                                    ], 8);
+                                    $patientQueryId = $patientQueryResp['ID'] ?? null;
+                                    if ($patientQueryId) {
+                                        $patientAnswers = callOrthanc('GET', "/queries/$patientQueryId/answers");
+                                        if (!empty($patientAnswers) && is_array($patientAnswers)) {
+                                            // tomar el primer resultado
+                                            $first = reset($patientAnswers);
+                                            $patientContent = callOrthanc('GET', "/queries/$patientQueryId/answers/$first/content?simplify");
+                                            if (is_array($patientContent)) {
+                                                $patientTags = $patientContent['PatientMainDicomTags'] ?? $patientContent['MainDicomTags'] ?? $patientContent;
+                                                $globalPatientName = $patientTags['PatientName'] ?? $patientTags['0010,0010'] ?? '';
+                                                if (is_array($globalPatientName)) {
+                                                    if (isset($globalPatientName['Alphabetic'])) {
+                                                        $globalPatientName = (string) $globalPatientName['Alphabetic'];
+                                                    } else {
+                                                        $globalPatientName = implode(' ', array_filter(array_map('strval', $globalPatientName)));
+                                                    }
+                                                } else {
+                                                    $globalPatientName = (string) $globalPatientName;
+                                                }
+                                                if ($globalPatientName !== '')
+                                                    $globalPatientName = str_replace('^', ' ', $globalPatientName);
+                                                $globalPatientName = preg_replace('/^PatientName\s+String\s+/i', '', $globalPatientName);
+                                            }
+                                        }
+                                        // borrar query
+                                        callOrthanc('DELETE', "/queries/$patientQueryId");
+                                    }
+                                } catch (Exception $e) {
+                                    // ignorar
+                                }
+                            }
+
+                            if (!$queryId) {
+                                // No se pudo crear la query, mostrar locales si hay
+                                $studies = $display;
+                                $localCount = count($display);
+                                if (!empty($studies)) {
+                                    $status = 'ok';
+                                    $message = 'Mostrando estudios locales (' . $localCount . '); no se pudo consultar Canvas.';
+                                } else {
+                                    $status = 'ok';
+                                    $message = 'No se encontraron estudios y no se pudo consultar Canvas.';
+                                }
+                            } else {
+                                $answers = callOrthanc('GET', "/queries/$queryId/answers");
+
+                                if (empty($answers) || !is_array($answers)) {
+                                    // No hay respuestas remotas; mantenemos solo los locales
+                                    $studies = $display;
+                                    $localCount = count($display);
+                                    if (!empty($studies)) {
+                                        $status = 'ok';
+                                        $message = 'No se encontraron estudios nuevos en Canvas. Mostrando los estudios presentes en Orthanc (' . $localCount . ').';
+                                    } else {
+                                        $status = 'ok';
+                                        $message = 'No se encontraron estudios ni en Orthanc ni en Canvas para ese criterio.';
+                                    }
+                                    // Borrar la query vacía
+                                    callOrthanc('DELETE', "/queries/$queryId");
+                                } else {
+                                    // Construir listado combinando locales y remotos (sin realizar retrieve)
+                                    $remoteStudyUids = [];
+                                    foreach ($answers as $idx) {
+                                        $content = callOrthanc('GET', "/queries/$queryId/answers/$idx/content?simplify");
+                                        if (is_array($content)) {
+                                            if (isset($content['MainDicomTags'])) {
+                                                $mainTags = $content['MainDicomTags'] ?? [];
+                                                $patientTags = $content['PatientMainDicomTags'] ?? [];
+                                                $norm = array_merge($mainTags, $patientTags);
                                             } else {
-                                                $globalPatientName = implode(' ', array_filter(array_map('strval', $globalPatientName)));
+                                                $norm = $content;
                                             }
                                         } else {
-                                            $globalPatientName = (string) $globalPatientName;
+                                            $norm = [];
                                         }
-                                        if ($globalPatientName !== '')
-                                            $globalPatientName = str_replace('^', ' ', $globalPatientName);
-                                        $globalPatientName = preg_replace('/^PatientName\s+String\s+/i', '', $globalPatientName);
+                                        $norm = normalizeQueryContent($norm);
+                                        // Si no tenemos StudyDate en la respuesta simplificada, intentar obtenerlo del contenido completo o de tags equivalentes
+                                        if (empty($norm['StudyDate'])) {
+                                            try {
+                                                $fullAnswer = callOrthanc('GET', "/queries/" . $queryId . "/answers/" . $idx . "/content");
+                                                if (is_array($fullAnswer)) {
+                                                    $fullTagsForDate = $fullAnswer['MainDicomTags'] ?? $fullAnswer;
+                                                    $sd = pickTag($fullTagsForDate, ['StudyDate', '0008,0020', 'SeriesDate', '0008,0021', 'AcquisitionDate', '0008,0022']);
+                                                    if ($sd !== '') {
+                                                        $norm['StudyDate'] = $sd;
+                                                    }
+                                                }
+                                            } catch (Exception $e) {
+                                                debug_log('could not fetch full answer content for date: ' . $e->getMessage());
+                                            }
+                                        }
+                                        $remoteUid = $norm['StudyInstanceUID'] ?? null;
+                                        if ($remoteUid && !isset($localStudyUids[$remoteUid]) && !isset($remoteStudyUids[$remoteUid])) {
+                                            $remoteStudyUids[$remoteUid] = true;
+
+                                            // Si la modalidad no vino explícita en C-FIND, inferirla instantáneamente de la descripción en memoria
+                                            // sin hacer consultas lentas de red C-FIND de series que congelaban la búsqueda.
+                                            if (empty($norm['ModalitiesInStudy'])) {
+                                                $desc = $norm['StudyDescription'] ?? '';
+                                                $inferred = getInferredModality($desc);
+                                                $norm['ModalitiesInStudy'] = $inferred ? [$inferred] : ['DX'];
+                                            }
+
+                                            $item = ['MainDicomTags' => $norm];
+                                            $item['_local'] = false;
+                                            $item['_remote'] = ['queryId' => $queryId, 'answerIdx' => $idx];
+                                            $display[] = $item;
+                                        }
                                     }
+
+                                    // Poblar ModalitiesInStudy si falta para estudios locales
+                                    foreach ($display as &$s) {
+                                        $tags = $s['MainDicomTags'];
+                                        $studyUid = $tags['StudyInstanceUID'] ?? null;
+                                        if (empty($tags['ModalitiesInStudy']) && $studyUid) {
+                                            $full = getOrthancStudyFullData($studyUid);
+                                            if ($full && isset($full['MainDicomTags']['ModalitiesInStudy'])) {
+                                                $s['MainDicomTags']['ModalitiesInStudy'] = $full['MainDicomTags']['ModalitiesInStudy'];
+                                            }
+                                        }
+                                    }
+                                    unset($s); // Evitar bug de referencia en el último elemento
+
+                                    // Aplicar filtro de modalidades si seleccionado
+                                    if (!empty($selectedModalities)) {
+                                        $display = array_filter($display, function ($s) use ($selectedModalities, $modalityMap) {
+                                            $mods = $s['MainDicomTags']['ModalitiesInStudy'] ?? [];
+                                            if (!is_array($mods))
+                                                $mods = [];
+                                            $mappedMods = array_map(
+                                                function ($m) use ($modalityMap) {
+                                                    return $modalityMap[trim($m)] ?? trim($m);
+                                                }
+                                                ,
+                                                $mods
+                                            );
+                                            // Si no hay modalidades mapeadas, inferir de la descripción
+                                            if (empty($mappedMods)) {
+                                                $desc = $s['MainDicomTags']['StudyDescription'] ?? '';
+                                                $inferred = getInferredModality($desc);
+                                                $mappedMods = $inferred ? [$inferred] : ['N/D'];
+                                            }
+                                            // Si incluye 'N/D', incluir siempre
+                                            if (in_array('N/D', $mappedMods)) {
+                                                return true;
+                                            }
+                                            return !empty(array_intersect($mappedMods, $selectedModalities));
+                                        });
+                                    }
+
+                                    // Guardamos el queryId, body y resultados en sesión para uso posterior (retrieve/paginación)
+                                    // Reabrir sesión para escritura (fue cerrada antes de las llamadas de red)
+                                    session_start();
+                                    $_SESSION['last_search_results'] = $display;
+                                    $_SESSION['last_query_data'] = ['id' => $queryId, 'when' => time(), 'body' => $query];
+                                    session_write_close();
+
+                                    $studies = $display;
+                                    $localCount = count(array_filter($display, fn($s) => isset($s['_local']) && $s['_local']));
+                                    $remoteCount = count($display) - $localCount;
+                                    $status = 'ok';
+                                    $filterMsg = !empty($selectedModalities) ? ' Filtro aplicado.' : '';
+                                    $message = 'Listado generado (' . $localCount . ' locales, ' . $remoteCount . ' remotos). Pulsa "Cargar y ver" para traer un estudio desde Canvas cuando lo necesites.' . $filterMsg;
                                 }
-                                // borrar query
-                                callOrthanc('DELETE', "/queries/$patientQueryId");
                             }
                         } catch (Exception $e) {
-                            // ignorar
+                            // Si falla la consulta remota, mostrar solo los locales con advertencia amigable
+                            $studies = $display;
+                            $localCount = count($display);
+                            if (!empty($studies)) {
+                                $status = 'warning';
+                                $message = 'Mostrando estudios locales (' . $localCount . '). No se pudo consultar Canvas: ' . $e->getMessage();
+                            } else {
+                                $status = 'warning';
+                                $message = 'No se encontraron estudios locales. Error al consultar Canvas: ' . $e->getMessage();
+                            }
                         }
-                    }
-
-                    if (!$queryId) {
-                        // No se pudo crear la query, mostrar locales si hay
+                    } else {
+                        // No hay criterios de búsqueda, mostrar locales si hay
                         $studies = $display;
                         $localCount = count($display);
                         if (!empty($studies)) {
                             $status = 'ok';
-                            $message = 'Mostrando estudios locales (' . $localCount . '); no se pudo consultar Canvas.';
+                            $message = 'Mostrando estudios locales (' . $localCount . ').';
                         } else {
                             $status = 'ok';
-                            $message = 'No se encontraron estudios y no se pudo consultar Canvas.';
-                        }
-                    } else {
-                        $answers = callOrthanc('GET', "/queries/$queryId/answers");
-
-                        if (empty($answers) || !is_array($answers)) {
-                            // No hay respuestas remotas; mantenemos solo los locales
-                            $studies = $display;
-                            $localCount = count($display);
-                            if (!empty($studies)) {
-                                $status = 'ok';
-                                $message = 'No se encontraron estudios nuevos en Canvas. Mostrando los estudios presentes en Orthanc (' . $localCount . ').';
-                            } else {
-                                $status = 'ok';
-                                $message = 'No se encontraron estudios ni en Orthanc ni en Canvas para ese criterio.';
-                            }
-                            // Borrar la query vacía
-                            callOrthanc('DELETE', "/queries/$queryId");
-                        } else {
-                            // Construir listado combinando locales y remotos (sin realizar retrieve)
-                            $remoteStudyUids = [];
-                            foreach ($answers as $idx) {
-                                $content = callOrthanc('GET', "/queries/$queryId/answers/$idx/content?simplify");
-                                if (is_array($content)) {
-                                    if (isset($content['MainDicomTags'])) {
-                                        $mainTags = $content['MainDicomTags'] ?? [];
-                                        $patientTags = $content['PatientMainDicomTags'] ?? [];
-                                        $norm = array_merge($mainTags, $patientTags);
-                                    } else {
-                                        $norm = $content;
-                                    }
-                                } else {
-                                    $norm = [];
-                                }
-                                $norm = normalizeQueryContent($norm);
-                                // Si no tenemos StudyDate en la respuesta simplificada, intentar obtener el contenido completo
-                                if (empty($norm['StudyDate'])) {
-                                    try {
-                                        $fullAnswer = callOrthanc('GET', "/queries/" . $queryId . "/answers/" . $idx . "/content");
-                                        if (is_array($fullAnswer)) {
-                                            $fullTagsForDate = $fullAnswer['MainDicomTags'] ?? $fullAnswer;
-                                            $sd = '';
-                                            if (isset($fullTagsForDate['StudyDate']))
-                                                $sd = extractTagValue($fullTagsForDate['StudyDate']);
-                                            if ($sd === '' && isset($fullTagsForDate['0008,0020']))
-                                                $sd = extractTagValue($fullTagsForDate['0008,0020']);
-                                            if ($sd !== '')
-                                                $norm['StudyDate'] = $sd;
-                                        }
-                                    } catch (Exception $e) {
-                                        // ignorar si falla leer contenido completo
-                                        debug_log('could not fetch full answer content for date: ' . $e->getMessage());
-                                    }
-                                }
-                                $remoteUid = $norm['StudyInstanceUID'] ?? null;
-                                if ($remoteUid && !isset($localStudyUids[$remoteUid]) && !isset($remoteStudyUids[$remoteUid])) {
-                                    $remoteStudyUids[$remoteUid] = true;
-                                    if (empty($norm['ModalitiesInStudy'])) {
-                                        // Intentar obtener las modalidades desde las series DICOM si no se reportan a nivel de estudio
-                                        $seriesQueryBody = [
-                                            'Level' => 'Series',
-                                            'Query' => ['0020,000D' => $remoteUid]
-                                        ];
-                                        $seriesQuery = callOrthanc('POST', "/modalities/$MODALITY_ID/query", $seriesQueryBody);
-                                        if ($seriesQuery && isset($seriesQuery['ID'])) {
-                                            $seriesAnswers = callOrthanc('GET', "/queries/" . $seriesQuery['ID'] . "/answers");
-                                            $modalities = [];
-                                            foreach ($seriesAnswers as $sidx) {
-                                                $scontent = callOrthanc('GET', "/queries/" . $seriesQuery['ID'] . "/answers/" . $sidx . "/content?simplify");
-                                                $smod = $scontent['Modality'] ?? '';
-                                                if ($smod)
-                                                    $modalities[] = $smod;
-                                            }
-                                            $modalities = array_unique($modalities);
-                                            if (!empty($modalities)) {
-                                                $norm['ModalitiesInStudy'] = $modalities;
-                                            }
-                                            // Intentar obtener la hora del estudio (StudyTime) extraída desde la primera serie si no viene
-                                            if (empty($norm['StudyTime']) && !empty($seriesAnswers)) {
-                                                $firstSeries = reset($seriesAnswers);
-                                                $scontent = callOrthanc('GET', "/queries/" . $seriesQuery['ID'] . "/answers/" . $firstSeries . "/content?simplify");
-                                                $norm['StudyTime'] = $scontent['AcquisitionTime'] ?? $scontent['SeriesTime'] ?? '';
-                                            }
-                                            callOrthanc('DELETE', "/queries/" . $seriesQuery['ID']);
-                                        }
-                                    }
-                                    $item = ['MainDicomTags' => $norm];
-                                    $item['_local'] = false;
-                                    $item['_remote'] = ['queryId' => $queryId, 'answerIdx' => $idx];
-                                    $display[] = $item;
-                                }
-                            }
-
-                            // Poblar ModalitiesInStudy si falta para estudios locales
-                            foreach ($display as &$s) {
-                                $tags = $s['MainDicomTags'];
-                                $studyUid = $tags['StudyInstanceUID'] ?? null;
-                                if (empty($tags['ModalitiesInStudy']) && $studyUid) {
-                                    $full = getOrthancStudyFullData($studyUid);
-                                    if ($full && isset($full['MainDicomTags']['ModalitiesInStudy'])) {
-                                        $s['MainDicomTags']['ModalitiesInStudy'] = $full['MainDicomTags']['ModalitiesInStudy'];
-                                    }
-                                }
-                            }
-                            unset($s); // Evitar bug de referencia en el último elemento
-
-                            // Aplicar filtro de modalidades si seleccionado
-                            if (!empty($selectedModalities)) {
-                                $display = array_filter($display, function ($s) use ($selectedModalities, $modalityMap) {
-                                    $mods = $s['MainDicomTags']['ModalitiesInStudy'] ?? [];
-                                    if (!is_array($mods))
-                                        $mods = [];
-                                    $mappedMods = array_map(
-                                        function ($m) use ($modalityMap) {
-                                            return $modalityMap[trim($m)] ?? trim($m);
-                                        }
-                                        ,
-                                        $mods
-                                    );
-                                    // Si no hay modalidades mapeadas, inferir de la descripción
-                                    if (empty($mappedMods)) {
-                                        $desc = $s['MainDicomTags']['StudyDescription'] ?? '';
-                                        $inferred = getInferredModality($desc);
-                                        $mappedMods = $inferred ? [$inferred] : ['N/D'];
-                                    }
-                                    // Si incluye 'N/D', incluir siempre
-                                    if (in_array('N/D', $mappedMods)) {
-                                        return true;
-                                    }
-                                    return !empty(array_intersect($mappedMods, $selectedModalities));
-                                });
-                            }
-
-                            // Guardamos el queryId, body y resultados en sesión para uso posterior (retrieve/paginación)
-                            $_SESSION['last_search_results'] = $display;
-
-                            $studies = $display;
-                            $localCount = count(array_filter($display, fn($s) => isset($s['_local']) && $s['_local']));
-                            $remoteCount = count($display) - $localCount;
-                            $status = 'ok';
-                            $filterMsg = !empty($selectedModalities) ? ' Filtro aplicado.' : '';
-                            $message = 'Listado generado (' . $localCount . ' locales, ' . $remoteCount . ' remotos). Pulsa "Cargar y ver" para traer un estudio desde Canvas cuando lo necesites.' . $filterMsg;
+                            $message = 'No se encontraron estudios para los criterios especificados.';
                         }
                     }
-                } catch (Exception $e) {
-                    // Si falla la consulta remota, mostrar solo los locales
-                    $studies = $display;
-                    $localCount = count($display);
-                    if (!empty($studies)) {
-                        $status = 'ok';
-                        $message = 'Mostrando estudios locales (' . $localCount . '); error al consultar Canvas: ' . $e->getMessage();
-                    } else {
-                        $status = 'ok';
-                        $message = 'No se encontraron estudios locales. Error al consultar Canvas: ' . $e->getMessage();
-                    }
                 }
-            } else {
-                // No hay criterios de búsqueda, mostrar locales si hay
-                $studies = $display;
-                $localCount = count($display);
-                if (!empty($studies)) {
-                    $status = 'ok';
-                    $message = 'Mostrando estudios locales (' . $localCount . ').';
-                } else {
-                    $status = 'ok';
-                    $message = 'No se encontraron estudios para los criterios especificados.';
-                }
+            } catch (Exception $e) {
+                $status = 'error';
+                $message = $e->getMessage();
+                $debugDetails = $e->getMessage();
             }
-        } catch (Exception $e) {
-            $status = 'error';
-            $message = $e->getMessage();
-            $debugDetails = $e->getMessage();
-        }
-        // Remover query de la lista activa
+        } // FIN DE PREVENCION BUSQUEDA MASIVA
+
+        // Remover query de la lista activa (reabrir sesión brevemente)
+        session_start();
         if (isset($_SESSION['active_queries'])) {
             array_pop($_SESSION['active_queries']);
         }
+        session_write_close();
     }
 }
 /**
@@ -1351,10 +1677,10 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
         if (!orthancStudyExists($studyUid)) {
             // En lugar de fallar, intentar iniciar retrieve automáticamente y redirigir a la página de espera
             $queryId = trim($_GET['query_id'] ?? '');
-    if ($queryId === '') {
-        $queryId = isset($_SESSION['last_query']['id']) ? $_SESSION['last_query']['id'] : '';
-    }
-    $answerIdx = trim($_GET['answer_idx'] ?? '');
+            if ($queryId === '') {
+                $queryId = isset($_SESSION['last_query']['id']) ? $_SESSION['last_query']['id'] : '';
+            }
+            $answerIdx = trim($_GET['answer_idx'] ?? '');
 
             // intentar recuperar desde session si no vienen en la URL
             if (($queryId === '' || $answerIdx === '') && isset($_SESSION['last_search_results']) && is_array($_SESSION['last_search_results'])) {
@@ -1465,28 +1791,32 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
                     if (!$instanceId)
                         continue;
 
-                    // pedir preview (imagen rasterizada) desde Orthanc
+                    // pedir preview (imagen JPEG lista para web) desde Orthanc con header directo
                     try {
-                        $png = callOrthancRaw('GET', '/instances/' . urlencode($instanceId) . '/preview');
+                        $png = callOrthancRaw('GET', '/instances/' . urlencode($instanceId) . '/preview', null, ['Accept: image/jpeg']);
                     } catch (Exception $e) {
                         // intentar siguiente instancia si falla
                         continue;
                     }
 
-                    // --- [MODIFICACIÓN] Soporte Fallback sin Librería GD ---
                     $fname = sprintf('%03d.jpg', $fileIndex);
                     $outPath = $workDir . DIRECTORY_SEPARATOR . $fname;
 
-                    if (function_exists('imagecreatefromstring')) {
+                    // Optimización de alto rendimiento: Si Orthanc ya devolvió un JPEG nativo válido,
+                    // escribirlo directamente a disco sin re-comprimir con GD (ahorra ~80% de CPU y RAM)
+                    if (substr($png, 0, 3) === "\xFF\xD8\xFF") {
+                        if (file_put_contents($outPath, $png) !== false) {
+                            $fileIndex++;
+                        }
+                    } elseif (function_exists('imagecreatefromstring')) {
+                        // Fallback con GD si es formato distinto (ej. PNG)
                         $img = @imagecreatefromstring($png);
                         if ($img !== false) {
-                            // calidad 85
                             imagejpeg($img, $outPath, 85);
                             imagedestroy($img);
                             $fileIndex++;
                         }
                     } else {
-                        // Si GD no existe, guardar el payload RAW JPEG que nos devolvió Orthanc en la ruta
                         if (file_put_contents($outPath, $png) !== false) {
                             $fileIndex++;
                         }
@@ -1693,7 +2023,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'wait_download' && isset($_SES
  de respuesta (Responsive UI) y define un motor visual moderno (Dark mode, 
  glassmorphism y transiciones suaves). No utiliza frameworks frontend como React/Vue. 
 -->
-<!DOCTYPE html>
+    <!DOCTYPE html>
     <html lang="es">
 
     <head>
@@ -1710,7 +2040,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'wait_download' && isset($_SES
     de descargas progresivas vía AJAX, generador de enlaces de compartición extendidos, 
     miniaturas (thumbnails) bajo demanda y control de selección múltiple (Batch).
     -->
-    <script>
+        <script>
             const currentTheme = localStorage.getItem('theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
             if (currentTheme === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
         </script>
@@ -1789,7 +2119,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'wait_download' && isset($_SES
     de descargas progresivas vía AJAX, generador de enlaces de compartición extendidos, 
     miniaturas (thumbnails) bajo demanda y control de selección múltiple (Batch).
     -->
-    <script>
+        <script>
             const study = <?php echo json_encode($studyUid); ?>;
             let stopped = false;
             document.getElementById('cancel').addEventListener('click', () => { stopped = true; window.location = '<?php echo $_SERVER['PHP_SELF']; ?>'; });
@@ -1946,24 +2276,35 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_download' && isset($_SE
         $aIdx = $jobInfo['answerIdx'] ?? null;
         $retries = $jobInfo['retries'] ?? 0;
 
-        // Si hay jobId, consultar estado del job
+        // Si hay jobId, consultar estado del job en Orthanc (/jobs/)
         if ($jobId) {
             try {
-                $task = callOrthanc('GET', '/tasks/' . urlencode($jobId));
-                $status = $task['Status'] ?? $task['status'] ?? null;
-                if ($status !== null) {
-                    $s = strtolower((string) $status);
-                    if (strpos($s, 'failed') !== false || strpos($s, 'error') !== false) {
-                        debug_log('check_download: job failed job=' . $jobId . ' status=' . $status);
-                        echo json_encode(['status' => 'failed', 'message' => 'El retrieve falló. Estado: ' . $status]);
+                try {
+                    $task = callOrthanc('GET', '/jobs/' . urlencode($jobId));
+                } catch (Exception $e) {
+                    $task = callOrthanc('GET', '/tasks/' . urlencode($jobId));
+                }
+                $state = $task['State'] ?? $task['Status'] ?? $task['status'] ?? null;
+                $progress = intval($task['Progress'] ?? 0);
+                if ($state !== null) {
+                    $s = strtolower((string) $state);
+                    if ($s === 'success') {
+                        debug_log('check_download: job succeeded job=' . $jobId);
+                        echo json_encode(['status' => 'ready', 'message' => 'Estudio transferido con éxito. Preparando descarga...']);
                         exit;
                     }
-                    debug_log('check_download: job pending job=' . $jobId . ' status=' . $status);
-                    echo json_encode(['status' => 'pending', 'message' => 'Retrieve en progreso (job ' . $jobId . '). Estado: ' . $status]);
+                    if (strpos($s, 'failed') !== false || strpos($s, 'error') !== false) {
+                        debug_log('check_download: job failed job=' . $jobId . ' error=' . ($task['ErrorDescription'] ?? ''));
+                        echo json_encode(['status' => 'failed', 'message' => 'El retrieve falló en ClearCanvas: ' . ($task['ErrorDescription'] ?? $state)]);
+                        exit;
+                    }
+                    debug_log('check_download: job pending job=' . $jobId . ' progress=' . $progress);
+                    $pct = max(10, min(95, $progress));
+                    echo json_encode(['status' => 'pending', 'progress' => $pct, 'message' => 'Retrieve en progreso (' . $pct . '%)...']);
                     exit;
                 }
             } catch (Exception $e) {
-                debug_log('check_download: error querying task ' . $jobId . ' error=' . $e->getMessage());
+                debug_log('check_download: error querying job ' . $jobId . ' error=' . $e->getMessage());
                 echo json_encode(['status' => 'pending', 'message' => 'Retrieve iniciado. Esperando llegada del estudio...']);
                 exit;
             }
@@ -3101,63 +3442,71 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                         </div>
 
                         <div class="card">
-                            <div class="card-header d-flex align-items-center">
-                                <div class="card-header-icon">🩻</div>
-                                <div>
-                                    <h3 style="margin:0;font-size:1.0rem;">Estudios encontrados en Orthanc para este
-                                        paciente</h3>
-                                    <p class="hint">Haz clic en “Ver en OHIF” para abrir el estudio en el visor web.</p>
-                                </div>
-                                <div class="ms-auto">
-                                    <form method="get" id="per-page-form" class="d-flex align-items-center">
-                                        <input type="hidden" name="patient_id"
-                                            value="<?php echo htmlspecialchars($patientIdValue, ENT_QUOTES); ?>">
-                                        <input type="hidden" name="date_from"
-                                            value="<?php echo htmlspecialchars($dateFromValue, ENT_QUOTES); ?>">
-                                        <input type="hidden" name="date_to"
-                                            value="<?php echo htmlspecialchars($dateToValue, ENT_QUOTES); ?>">
-                                        <input type="hidden" name="sort"
-                                            value="<?php echo htmlspecialchars($sort, ENT_QUOTES); ?>">
-                                        <input type="hidden" name="page" value="1">
-                                        <?php if (!empty($forceRemote)): ?>
-                                            <input type="hidden" name="force_remote" value="1">
-                                            <?php
-                                        endif; ?>
-                                        <?php foreach ($selectedModalities as $m): ?>
-                                            <input type="hidden" name="modalities[]"
-                                                value="<?php echo htmlspecialchars($m, ENT_QUOTES); ?>">
-                                            <?php
-                                        endforeach; ?>
-                                        <div class="btn-group">
-                                            <input type="hidden" id="per_page_input" name="per_page"
-                                                value="<?php echo $perPage; ?>">
-                                            <button type="button"
-                                                class="btn btn-sm btn-outline-secondary dropdown-toggle per-page-btn"
-                                                data-bs-toggle="dropdown" aria-expanded="false">
-                                                <i class="bi bi-list-ul"></i>
-                                                <span class="visually-hidden">Filas</span>
-                                                <span class="fw-bold ms-1 per-page-label"><?php echo $perPage; ?></span>
-                                            </button>
-                                            <ul class="dropdown-menu dropdown-menu-end">
-                                                <li><button class="dropdown-item per-page-option"
-                                                        data-value="10">10</button></li>
-                                                <li><button class="dropdown-item per-page-option"
-                                                        data-value="25">25</button></li>
-                                                <li><button class="dropdown-item per-page-option"
-                                                        data-value="50">50</button></li>
-                                                <li><button class="dropdown-item per-page-option"
-                                                        data-value="100">100</button></li>
-                                            </ul>
-                                        </div>
-                                    </form>
-                                </div>
-                            </div>
-
                             <div class="results-inner">
                                 <?php if (isset($_GET['ajax'])) {
                                     ob_end_clean();
                                     ob_start();
                                 } ?>
+                                <div class="card-header d-flex align-items-center">
+                                    <div class="card-header-icon">🩻</div>
+                                    <div>
+                                        <h3 style="margin:0;font-size:1.0rem;">Estudios encontrados en Orthanc para este
+                                            paciente</h3>
+                                        <p class="hint">Haz clic en “Ver en OHIF” para abrir el estudio en el visor web.</p>
+                                    </div>
+                                    <div class="ms-auto">
+                                        <form method="get" id="perPageForm" class="d-flex align-items-center">
+                                            <input type="hidden" name="patient_id"
+                                                value="<?php echo htmlspecialchars($patientIdValue, ENT_QUOTES); ?>">
+                                            <input type="hidden" name="date_from"
+                                                value="<?php echo htmlspecialchars($dateFromValue, ENT_QUOTES); ?>">
+                                            <input type="hidden" name="date_to"
+                                                value="<?php echo htmlspecialchars($dateToValue, ENT_QUOTES); ?>">
+                                            <input type="hidden" name="sort"
+                                                value="<?php echo htmlspecialchars($sort, ENT_QUOTES); ?>">
+                                            <input type="hidden" name="page" value="1">
+                                            <?php if (!empty($forceRemote)): ?>
+                                                <input type="hidden" name="force_remote" value="1">
+                                                <?php
+                                            endif; ?>
+                                            <?php foreach ($selectedModalities as $m): ?>
+                                                <input type="hidden" name="modalities[]"
+                                                    value="<?php echo htmlspecialchars($m, ENT_QUOTES); ?>">
+                                                <?php
+                                            endforeach; ?>
+                                            <div class="btn-group">
+                                                <input type="hidden" id="per_page_input" name="per_page"
+                                                    value="<?php echo $perPage; ?>">
+                                                <button type="button"
+                                                    class="btn btn-sm btn-outline-secondary dropdown-toggle per-page-btn"
+                                                    data-bs-toggle="dropdown" aria-expanded="false">
+                                                    <i class="bi bi-list-ul"></i>
+                                                    <span class="visually-hidden">Filas</span>
+                                                    <span class="fw-bold ms-1 per-page-label"><?php echo $perPage; ?></span>
+                                                </button>
+                                                <ul class="dropdown-menu dropdown-menu-end">
+                                                    <li><button type="button" class="dropdown-item per-page-option"
+                                                            data-value="10">10</button></li>
+                                                    <li><button type="button" class="dropdown-item per-page-option"
+                                                            data-value="25">25</button></li>
+                                                    <li><button type="button" class="dropdown-item per-page-option"
+                                                            data-value="50">50</button></li>
+                                                    <li><button type="button" class="dropdown-item per-page-option"
+                                                            data-value="100">100</button></li>
+                                                </ul>
+                                            </div>
+                                        </form>
+                                    </div>
+                                </div>
+
+                                <?php
+                                $modSuffix = '';
+                                if (!empty($selectedModalities)) {
+                                    foreach ($selectedModalities as $m) {
+                                        $modSuffix .= '&modalities[]=' . urlencode($m);
+                                    }
+                                }
+                                ?>
                                 <?php if (!empty($studies)): ?>
                                     <div class="table-responsive">
                                         <table class="table table-sm table-striped table-hover">
@@ -3167,12 +3516,12 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                         <input type="checkbox" class="form-check-input" id="check-all-batch"
                                                             title="Seleccionar todos">
                                                     </th>
-                                                    <th><a href="?sort=date&page=1&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?>"
+                                                    <th><a href="?sort=date&page=1&per_page=<?php echo $perPage; ?>&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?><?php echo $modSuffix; ?>"
                                                             style="color: inherit; text-decoration: none;">Fecha<?php if ($sort === 'date')
                                                                 echo ($_SESSION['sort_order'] === 'asc' ? ' ↑' : ' ↓'); ?></a>
                                                     </th>
                                                     <th>ID Paciente</th>
-                                                    <th><a href="?sort=name&page=1&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?>"
+                                                    <th><a href="?sort=name&page=1&per_page=<?php echo $perPage; ?>&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?><?php echo $modSuffix; ?>"
                                                             style="color: inherit; text-decoration: none;">Nombre<?php if ($sort === 'name')
                                                                 echo ($_SESSION['sort_order'] === 'asc' ? ' ↑' : ' ↓'); ?></a>
                                                     </th>
@@ -3188,16 +3537,27 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                     $tags = array_merge($s['MainDicomTags'] ?? [], $s['PatientMainDicomTags'] ?? []);
                                                     $studyUid = $tags['StudyInstanceUID'] ?? null;
 
-                                                    // Obtener datos completos del estudio desde Orthanc para asegurar PatientID y PatientName
+                                                    // --- [MEJORA RENDIMIENTO] Una sola llamada a Orthanc por estudio (cacheada).
+                                                    // getOrthancStudyFullData usa caché en memoria, así que las 2-3 llamadas
+                                                    // anteriores quedan reducidas a UNA SOLA por estudio en toda la página.
                                                     if ($studyUid) {
-                                                        $fullTags = getOrthancStudyFullData($studyUid);
-                                                        if ($fullTags && is_array($fullTags)) {
-                                                            // Enriquecer tags con datos completos de Orthanc
-                                                            $tags = array_merge($tags, $fullTags['MainDicomTags'] ?? [], $fullTags['PatientMainDicomTags'] ?? $fullTags);
+                                                        $fullData = getOrthancStudyFullData($studyUid);
+                                                        if ($fullData && is_array($fullData)) {
+                                                            // Enriquecer tags con datos completos de Orthanc (una sola consulta)
+                                                            $tags = array_merge($tags, $fullData['MainDicomTags'] ?? [], $fullData['PatientMainDicomTags'] ?? []);
+                                                            // Si falta ModalitiesInStudy, tomarlo del fullData directamente
+                                                            if (empty($tags['ModalitiesInStudy']) && isset($fullData['MainDicomTags']['ModalitiesInStudy'])) {
+                                                                $tags['ModalitiesInStudy'] = $fullData['MainDicomTags']['ModalitiesInStudy'];
+                                                            }
                                                         }
+                                                    } else {
+                                                        $fullData = null;
                                                     }
 
-                                                    $rawDate = pickTag($tags, ['StudyDate', '0008,0020']);
+                                                    $rawDate = pickTag($tags, ['StudyDate', '0008,0020', 'SeriesDate', '0008,0021', 'AcquisitionDate', '0008,0022']);
+                                                    if (empty($rawDate) && $fullData) {
+                                                        $rawDate = pickTag($fullData['MainDicomTags'] ?? [], ['StudyDate', '0008,0020', 'SeriesDate', '0008,0021', 'AcquisitionDate', '0008,0022']);
+                                                    }
                                                     $rawTime = pickTag($tags, ['StudyTime', 'SeriesTime', 'AcquisitionTime', '0008,0030']) ?: ($s['StudyTime'] ?? '');
                                                     $desc = pickTag($tags, ['StudyDescription', 'SeriesDescription', 'ProtocolName']);
                                                     // Obtener PatientID y PatientName por separado (sin fallback cruzado)
@@ -3207,28 +3567,17 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                     $patientName = !empty($globalPatientName) ? $globalPatientName : pickTag($tags, ['PatientName', '0010,0010', 'Patient']);
                                                     $patientName = $patientName !== '' ? str_replace('^', ' ', $patientName) : '';
                                                     $patientName = preg_replace('/^PatientName\s+String\s+/i', '', $patientName);
-                                                    // Si no obtuvimos nombre en la respuesta inicial, intentar obtenerlo desde los tags completos del estudio en Orthanc
-                                                    if (($patientName === '' || strtolower($patientName) === 'sin nombre') && $studyUid) {
-                                                        $full = getOrthancStudyFullData($studyUid);
-                                                        if (!empty($full) && isset($full['PatientMainDicomTags']['PatientName']) && $full['PatientMainDicomTags']['PatientName'] !== '') {
-                                                            $tempName = $full['PatientMainDicomTags']['PatientName'];
+                                                    // Si no hay nombre, buscarlo en fullData (ya cacheado, sin costo extra)
+                                                    if (($patientName === '' || strtolower($patientName) === 'sin nombre') && $fullData) {
+                                                        $tempName = $fullData['PatientMainDicomTags']['PatientName'] ?? '';
+                                                        if ($tempName !== '') {
                                                             if (is_array($tempName)) {
-                                                                if (isset($tempName['Alphabetic'])) {
-                                                                    $tempName = (string) $tempName['Alphabetic'];
-                                                                } else {
-                                                                    $tempName = implode(' ', array_filter(array_map('strval', $tempName)));
-                                                                }
-                                                            } else {
-                                                                $tempName = (string) $tempName;
+                                                                $tempName = isset($tempName['Alphabetic'])
+                                                                    ? (string) $tempName['Alphabetic']
+                                                                    : implode(' ', array_filter(array_map('strval', $tempName)));
                                                             }
-                                                            $patientName = str_replace('^', ' ', $tempName);
+                                                            $patientName = str_replace('^', ' ', (string) $tempName);
                                                             $patientName = preg_replace('/^PatientName\s+String\s+/i', '', $patientName);
-                                                        }
-                                                    }
-                                                    if (empty($tags['ModalitiesInStudy']) && !empty($s['_local']) && $studyUid) {
-                                                        $full = getOrthancStudyFullData($studyUid);
-                                                        if ($full && isset($full['MainDicomTags']['ModalitiesInStudy'])) {
-                                                            $tags['ModalitiesInStudy'] = $full['MainDicomTags']['ModalitiesInStudy'];
                                                         }
                                                     }
                                                     if ($patientName === '') {
@@ -3238,8 +3587,8 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                     $timeText = formatDicomTime($rawTime);
 
                                                     $mods = '';
-                                                    if (!empty($tags['ModalitiesInStudy']) && is_array($tags['ModalitiesInStudy'])) {
-                                                        $mods = implode(',', $tags['ModalitiesInStudy']);
+                                                    if (!empty($tags['ModalitiesInStudy'])) {
+                                                        $mods = is_array($tags['ModalitiesInStudy']) ? implode(',', $tags['ModalitiesInStudy']) : (string)$tags['ModalitiesInStudy'];
                                                     } else {
                                                         $modFromTags = $tags['Modality'] ?? '';
                                                         $modFromStudy = $s['Modality'] ?? '';
@@ -3260,35 +3609,8 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                     }, $modList);
                                                     $mods = implode(',', $mappedMods);
 
-                                                    if (!$mods && $studyUid) {
-                                                        // Tratar de recuperar las modalidades preguntando directamente a Orthanc por el nivel "Serie"
-                                                        try {
-                                                            $series = callOrthanc('GET', '/studies/' . urlencode($studyUid) . '/series');
-                                                            if (is_array($series)) {
-                                                                $modalities = [];
-                                                                foreach ($series as $ser) {
-                                                                    if (isset($ser['MainDicomTags']['Modality'])) {
-                                                                        $modalities[] = $ser['MainDicomTags']['Modality'];
-                                                                    }
-                                                                }
-                                                                $modalities = array_unique($modalities);
-                                                                if (!empty($modalities)) {
-                                                                    $mods = implode(',', $modalities);
-                                                                    $modList = explode(',', $mods);
-                                                                    $mappedMods = array_map(function ($m) use ($modalityMap) {
-                                                                        $trimmed = trim($m);
-                                                                        return $modalityMap[$trimmed] ?? $trimmed;
-                                                                    }, $modList);
-                                                                    $mods = implode(',', $mappedMods);
-                                                                }
-                                                            }
-                                                        } catch (Exception $e) {
-                                                            // Ignorar el error si el estudio fue borrado o no responde
-                                                        }
-                                                    }
-
                                                     if (!$mods) {
-                                                        // Inferir modalidad desde la descripción
+                                                        // Inferir modalidad desde la descripción (sin llamadas extra a Orthanc)
                                                         $inferred = getInferredModality($desc);
                                                         $mods = $inferred ?: 'N/D';
                                                     }
@@ -3344,7 +3666,11 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                                     <a href="?action=view&study_uid=<?php echo urlencode($studyUid); ?>"
                                                                         target="_blank" rel="noopener noreferrer"
                                                                         class="btn btn-secondary btn-sm btn-visualize"
-                                                                        data-bs-toggle="tooltip" title="Visualizar estudio">
+                                                                        data-uid="<?php echo htmlspecialchars($studyUid, ENT_QUOTES); ?>"
+                                                                        data-local="1"
+                                                                        data-patient="<?php echo htmlspecialchars($patientName ?: 'Paciente', ENT_QUOTES); ?>"
+                                                                        data-desc="<?php echo htmlspecialchars($desc ?: 'Estudio DICOM', ENT_QUOTES); ?>"
+                                                                        data-bs-toggle="tooltip" title="Visualizar estudio (Disponible localmente)">
                                                                         <i class="bi bi-eye"></i> Visualizar
                                                                     </a>
                                                                     <a href="?action=download&study_uid=<?php echo urlencode($studyUid); ?>&download_now=1"
@@ -3361,8 +3687,14 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                                                     <a href="?action=view&study_uid=<?php echo urlencode($studyUid); ?>&query_id=<?php echo urlencode($s['_remote']['queryId'] ?? ($_SESSION['last_query']['id'] ?? '')); ?>&answer_idx=<?php echo urlencode($s['_remote']['answerIdx'] ?? ''); ?>"
                                                                         target="_blank" rel="noopener noreferrer"
                                                                         class="btn btn-secondary btn-sm btn-visualize"
+                                                                        data-uid="<?php echo htmlspecialchars($studyUid, ENT_QUOTES); ?>"
+                                                                        data-local="0"
+                                                                        data-query="<?php echo htmlspecialchars($s['_remote']['queryId'] ?? ($_SESSION['last_query']['id'] ?? ''), ENT_QUOTES); ?>"
+                                                                        data-answer="<?php echo htmlspecialchars($s['_remote']['answerIdx'] ?? '', ENT_QUOTES); ?>"
+                                                                        data-patient="<?php echo htmlspecialchars($patientName ?: 'Paciente', ENT_QUOTES); ?>"
+                                                                        data-desc="<?php echo htmlspecialchars($desc ?: 'Estudio DICOM', ENT_QUOTES); ?>"
                                                                         data-bs-toggle="tooltip"
-                                                                        title="Visualizar estudio (traer desde Canvas)">
+                                                                        title="Visualizar estudio (precargar desde Canvas)">
                                                                         <i class="bi bi-eye"></i> Visualizar
                                                                     </a>
                                                                     <a href="?action=download&study_uid=<?php echo urlencode($studyUid); ?>&query_id=<?php echo urlencode($s['_remote']['queryId'] ?? ($_SESSION['last_query']['id'] ?? '')); ?>&answer_idx=<?php echo urlencode($s['_remote']['answerIdx'] ?? ''); ?>"
@@ -3390,37 +3722,37 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
                                             </tbody>
                                         </table>
                                     </div>
-                                </div>
-                                <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;">
-                                    <div class="hint">
-                                        <?php
-                                        $showFrom = ($page - 1) * $perPage + 1;
-                                        $showTo = min($totalResults, $page * $perPage);
-                                        if ($totalResults === 0) {
-                                            echo 'Mostrando 0 resultados.';
-                                        } else {
-                                            echo 'Mostrando ' . $showFrom . ' - ' . $showTo . ' de ' . $totalResults . ' estudios.';
-                                        }
-                                        ?>
-                                    </div>
-                                    <div>
-                                        <?php if ($page > 1): ?>
-                                            <a href="?page=<?php echo $page - 1; ?>&sort=<?php echo $sort; ?>&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?>"
-                                                class="btn btn-outline-secondary rounded-pill btn-sm">◀ Anterior</a>
+                                    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;">
+                                        <div class="hint">
                                             <?php
-                                        endif; ?>
-                                        <?php if ($page < $totalPages): ?>
-                                            <a href="?page=<?php echo $page + 1; ?>&sort=<?php echo $sort; ?>&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?>"
-                                                class="btn btn-outline-secondary rounded-pill btn-sm">Siguiente ▶</a>
-                                            <?php
-                                        endif; ?>
+                                            $showFrom = ($page - 1) * $perPage + 1;
+                                            $showTo = min($totalResults, $page * $perPage);
+                                            if ($totalResults === 0) {
+                                                echo 'Mostrando 0 resultados.';
+                                            } else {
+                                                echo 'Mostrando ' . $showFrom . ' - ' . $showTo . ' de ' . $totalResults . ' estudios.';
+                                            }
+                                            ?>
+                                        </div>
+                                        <div>
+                                            <?php if ($page > 1): ?>
+                                                <a href="?page=<?php echo $page - 1; ?>&per_page=<?php echo $perPage; ?>&sort=<?php echo $sort; ?>&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?><?php echo $modSuffix; ?>"
+                                                    class="btn btn-outline-secondary rounded-pill btn-sm">◀ Anterior</a>
+                                                <?php
+                                            endif; ?>
+                                            <?php if ($page < $totalPages): ?>
+                                                <a href="?page=<?php echo $page + 1; ?>&per_page=<?php echo $perPage; ?>&sort=<?php echo $sort; ?>&patient_id=<?php echo urlencode($patientIdValue); ?>&date_from=<?php echo urlencode($dateFromValue); ?>&date_to=<?php echo urlencode($dateToValue); ?><?php echo $forceRemote ? '&force_remote=1' : ''; ?><?php echo $modSuffix; ?>"
+                                                    class="btn btn-outline-secondary rounded-pill btn-sm">Siguiente ▶</a>
+                                                <?php
+                                            endif; ?>
+                                        </div>
                                     </div>
-                                </div>
-                                <?php
+                                    <?php
                                 else: ?>
-                                <p class="hint">No se encontraron estudios que coincidan con los criterios de búsqueda.</p>
-                                <?php
+                                    <p class="hint">No se encontraron estudios que coincidan con los criterios de búsqueda.</p>
+                                    <?php
                                 endif; ?>
+                            </div> <!-- Cierre correcto de results-inner -->
                             <?php
                             if (isset($_GET['ajax'])) {
                                 $html = ob_get_clean();
@@ -3496,6 +3828,56 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
             <div class="mt-2 text-dark fw-bold">Procesando...</div>
         </div>
     </div>
+
+    <!-- ========================================================================= -->
+    <!-- VENTANA FLOTANTE DE CARGA EN SEGUNDO PLANO (VISUALIZACIÓN DE ESTUDIOS)    -->
+    <!-- ========================================================================= -->
+    <div id="viewer-load-modal"
+        style="display:none; position:fixed; inset:0; z-index:99999; background:rgba(15,23,42,0.75); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); align-items:center; justify-content:center; padding:16px;">
+        <div style="background:var(--card-bg, #ffffff); border-radius:24px; padding:32px 28px; max-width:480px; width:100%; box-shadow:0 25px 60px -15px rgba(0,0,0,0.35); border:1px solid rgba(255,255,255,0.25); text-align:center; position:relative; animation:viewerPopIn 0.3s cubic-bezier(0.16,1,0.3,1);">
+            
+            <!-- Icono circular animado -->
+            <div id="viewer-modal-icon-wrap"
+                style="width:72px; height:72px; margin:0 auto 16px; border-radius:50%; background:linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); display:flex; align-items:center; justify-content:center; box-shadow:0 8px 20px rgba(37,99,235,0.15); transition:all 0.3s ease;">
+                <i class="bi bi-cloud-arrow-down-fill text-primary" style="font-size:2rem;" id="viewer-modal-icon"></i>
+            </div>
+
+            <h4 style="font-weight:700; margin-bottom:6px; color:var(--text-main, #0f172a); font-family:'Outfit',sans-serif;">Preparando Visualización</h4>
+            <p style="font-size:0.92rem; color:var(--text-muted, #64748b); margin-bottom:20px; word-break:break-word;" id="viewer-modal-study-info">Cargando imágenes del estudio en segundo plano...</p>
+
+            <!-- Barra de Progreso -->
+            <div style="background:rgba(226,232,240,0.85); border-radius:14px; height:20px; overflow:hidden; position:relative; margin-bottom:12px; box-shadow:inset 0 2px 4px rgba(0,0,0,0.06);">
+                <div id="viewer-modal-bar"
+                    style="width:0%; height:100%; border-radius:14px; background:linear-gradient(90deg, #2563eb, #3b82f6); transition:width 0.4s cubic-bezier(0.4, 0, 0.2, 1), background 0.3s ease; position:relative;">
+                </div>
+            </div>
+
+            <!-- Porcentaje y Estado Dinámico -->
+            <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.92rem; margin-bottom:20px;">
+                <span id="viewer-modal-status" style="font-weight:600; color:#2563eb; text-align:left; max-width:78%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Conectando con ClearCanvas...</span>
+                <span id="viewer-modal-pct" style="font-weight:800; font-size:1.15rem; color:var(--text-main, #0f172a); font-family:'Outfit',sans-serif;">0%</span>
+            </div>
+
+            <div style="font-size:0.82rem; color:var(--text-muted, #94a3b8); margin-bottom:22px; line-height:1.4;">
+                <i class="bi bi-shield-check me-1 text-success"></i> La ventana del visor se abrirá de inmediato apenas las imágenes queden al 100% en el servidor para que no tengas que esperar pantalla negra.
+            </div>
+
+            <div class="d-flex gap-2 justify-content-center">
+                <button type="button" id="viewer-modal-open-now" class="btn btn-success d-none" style="border-radius:14px; padding:8px 24px; font-weight:600;">
+                    <i class="bi bi-box-arrow-up-right me-1"></i> Abrir Visor Ahora
+                </button>
+                <button type="button" id="viewer-modal-cancel" class="btn btn-outline-secondary" style="border-radius:14px; padding:8px 22px; font-size:0.9rem;">
+                    Cancelar
+                </button>
+            </div>
+        </div>
+    </div>
+    <style>
+        @keyframes viewerPopIn {
+            0% { opacity:0; transform:scale(0.88); }
+            100% { opacity:1; transform:scale(1); }
+        }
+    </style>
 
     <!-- Thumbnail Overlay -->
     <!--
@@ -3717,16 +4099,205 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
             var tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
             tooltipTriggerList.forEach(function (el) { new bootstrap.Tooltip(el); });
 
-            // Overlay show on Visualizar click
+            // =====================================================================
+            // MANEJADOR DE VISUALIZACIÓN: VENTANA FLOTANTE Y CARGA AL 100%
+            // =====================================================================
             document.querySelectorAll('.btn-visualize').forEach(function (btn) {
                 btn.replaceWith(btn.cloneNode(true));
             });
+
+            var activeViewerPoll = null;
+
             document.querySelectorAll('.btn-visualize').forEach(function (btn) {
-                btn.addEventListener('click', function () {
-                    var overlay = document.getElementById('action-overlay');
-                    if (overlay) overlay.style.display = 'flex';
-                    btn.classList.add('disabled');
-                    setTimeout(function () { if (overlay) overlay.style.display = 'none'; btn.classList.remove('disabled'); }, 1500);
+                btn.addEventListener('click', function (e) {
+                    e.preventDefault();
+
+                    var studyUid = this.getAttribute('data-uid') || '';
+                    var isLocal = this.getAttribute('data-local') === '1';
+                    var queryId = this.getAttribute('data-query') || '';
+                    var answerIdx = this.getAttribute('data-answer') || '';
+                    var patientName = this.getAttribute('data-patient') || 'Paciente';
+                    var studyDesc = this.getAttribute('data-desc') || 'Estudio DICOM';
+                    var hrefUrl = this.getAttribute('href') || '';
+
+                    if (!studyUid) {
+                        if (hrefUrl) window.open(hrefUrl, '_blank');
+                        return;
+                    }
+
+                    // Elementos de la ventana flotante
+                    var modal = document.getElementById('viewer-load-modal');
+                    var modalIcon = document.getElementById('viewer-modal-icon');
+                    var modalInfo = document.getElementById('viewer-modal-study-info');
+                    var modalBar = document.getElementById('viewer-modal-bar');
+                    var modalStatus = document.getElementById('viewer-modal-status');
+                    var modalPct = document.getElementById('viewer-modal-pct');
+                    var cancelBtn = document.getElementById('viewer-modal-cancel');
+                    var openNowBtn = document.getElementById('viewer-modal-open-now');
+
+                    if (!modal) {
+                        if (hrefUrl) window.open(hrefUrl, '_blank');
+                        return;
+                    }
+
+                    // Limpiar intervalos previos si los hubiera
+                    if (activeViewerPoll) {
+                        clearInterval(activeViewerPoll);
+                        activeViewerPoll = null;
+                    }
+
+                    // Configurar vista inicial del modal
+                    modalInfo.textContent = patientName + ' • ' + studyDesc;
+                    modalBar.style.width = '0%';
+                    modalBar.style.background = 'linear-gradient(90deg, #2563eb, #3b82f6)';
+                    modalPct.textContent = '0%';
+                    modalStatus.style.color = '#2563eb';
+                    modalStatus.textContent = isLocal ? 'Estudio local disponible. Abriendo...' : 'Conectando con ClearCanvas...';
+                    modalIcon.className = 'bi bi-cloud-arrow-down-fill text-primary';
+                    if (openNowBtn) openNowBtn.classList.add('d-none');
+                    modal.style.display = 'flex';
+
+                    // Handler botón cancelar
+                    cancelBtn.onclick = function () {
+                        if (activeViewerPoll) {
+                            clearInterval(activeViewerPoll);
+                            activeViewerPoll = null;
+                        }
+                        modal.style.display = 'none';
+                    };
+
+                    // Función para completar al 100% y abrir el visor OHIF
+                    function onCompleteAndOpen(finalUrl) {
+                        if (activeViewerPoll) {
+                            clearInterval(activeViewerPoll);
+                            activeViewerPoll = null;
+                        }
+
+                        modalBar.style.width = '100%';
+                        modalBar.style.background = 'linear-gradient(90deg, #10b981, #059669)';
+                        modalPct.textContent = '100%';
+                        modalStatus.style.color = '#10b981';
+                        modalStatus.textContent = '¡100% Completado! Todas las imágenes listas en el servidor.';
+                        modalIcon.className = 'bi bi-check-circle-fill text-success';
+
+                        // Actualizar la fila en la tabla para marcarla como local
+                        btn.setAttribute('data-local', '1');
+                        btn.classList.remove('btn-secondary');
+                        btn.classList.add('btn-primary');
+                        btn.setAttribute('title', 'Visualizar estudio (Disponible localmente)');
+
+                        // Configurar botón "Abrir Visor Ahora" por si el navegador bloquea la ventana emergente
+                        if (openNowBtn) {
+                            openNowBtn.classList.remove('d-none');
+                            openNowBtn.onclick = function () {
+                                window.open(finalUrl, '_blank');
+                                modal.style.display = 'none';
+                            };
+                        }
+
+                        // Intentar abrir la pestaña automáticamente
+                        setTimeout(function () {
+                            var win = window.open(finalUrl, '_blank');
+                            // Si se abrió correctamente, cerrar modal suavemente tras 1 segundo
+                            if (win && !win.closed) {
+                                setTimeout(function () {
+                                    modal.style.display = 'none';
+                                }, 1200);
+                            }
+                        }, 500);
+                    }
+
+                    // CASO 1: Estudio ya disponible en local
+                    if (isLocal) {
+                        modalBar.style.width = '60%';
+                        modalPct.textContent = '60%';
+                        fetch('?action=start_view_retrieve&study_uid=' + encodeURIComponent(studyUid))
+                            .then(function (r) { return r.json(); })
+                            .then(function (data) {
+                                onCompleteAndOpen(data.ohifUrl || hrefUrl);
+                            })
+                            .catch(function () {
+                                onCompleteAndOpen(hrefUrl);
+                            });
+                        return;
+                    }
+
+                    // CASO 2: Estudio remoto -> disparar C-MOVE y monitorear hasta llegar a 100%
+                    modalBar.style.width = '15%';
+                    modalPct.textContent = '15%';
+                    modalStatus.textContent = 'Iniciando transferencia en segundo plano desde ClearCanvas...';
+
+                    var startUrl = '?action=start_view_retrieve&study_uid=' + encodeURIComponent(studyUid) +
+                        '&query_id=' + encodeURIComponent(queryId) +
+                        '&answer_idx=' + encodeURIComponent(answerIdx);
+
+                    fetch(startUrl)
+                        .then(function (r) { return r.json(); })
+                        .then(function (data) {
+                            if (data.status === 'ready') {
+                                onCompleteAndOpen(data.ohifUrl || hrefUrl);
+                                return;
+                            }
+                            if (data.status === 'error') {
+                                modalStatus.style.color = '#ef4444';
+                                modalStatus.textContent = 'Error: ' + (data.message || 'No se pudo iniciar.');
+                                modalBar.style.background = '#ef4444';
+                                modalIcon.className = 'bi bi-exclamation-triangle-fill text-danger';
+                                return;
+                            }
+
+                            var jobId = data.jobId || '';
+                            var targetOhif = data.ohifUrl || hrefUrl;
+                            var currentPct = data.progress || 20;
+
+                            modalBar.style.width = currentPct + '%';
+                            modalPct.textContent = currentPct + '%';
+                            modalStatus.textContent = data.message || 'Descargando imágenes DICOM...';
+
+                            // Polling periódico cada 1000ms
+                            var startTime = Date.now();
+                            activeViewerPoll = setInterval(function () {
+                                // Límite de seguridad: 3 minutos
+                                if (Date.now() - startTime > 180000) {
+                                    clearInterval(activeViewerPoll);
+                                    activeViewerPoll = null;
+                                    modalStatus.textContent = 'Tiempo límite alcanzado. Abriendo visor con imágenes cargadas...';
+                                    onCompleteAndOpen(targetOhif);
+                                    return;
+                                }
+
+                                fetch('?action=check_view_job&study_uid=' + encodeURIComponent(studyUid) + '&job_id=' + encodeURIComponent(jobId))
+                                    .then(function (r) { return r.json(); })
+                                    .then(function (poll) {
+                                        if (poll.status === 'ready' || poll.progress >= 100) {
+                                            onCompleteAndOpen(poll.ohifUrl || targetOhif);
+                                        } else if (poll.status === 'error') {
+                                            clearInterval(activeViewerPoll);
+                                            activeViewerPoll = null;
+                                            modalStatus.style.color = '#ef4444';
+                                            modalStatus.textContent = poll.message || 'Error en la transferencia.';
+                                            modalBar.style.background = '#ef4444';
+                                            modalIcon.className = 'bi bi-exclamation-triangle-fill text-danger';
+                                        } else {
+                                            var pct = poll.progress || Math.min(95, currentPct + 8);
+                                            currentPct = pct;
+                                            modalBar.style.width = pct + '%';
+                                            modalPct.textContent = pct + '%';
+                                            modalStatus.textContent = poll.message || 'Transfiriendo imágenes DICOM (' + pct + '%)...';
+                                        }
+                                    })
+                                    .catch(function (err) {
+                                        console.warn('Polling status warning:', err);
+                                    });
+                            }, 1000);
+                        })
+                        .catch(function (err) {
+                            console.error('Error al iniciar recuperación:', err);
+                            modalStatus.style.color = '#ef4444';
+                            modalStatus.textContent = 'Error de conexión con el servidor.';
+                            modalBar.style.background = '#ef4444';
+                            modalIcon.className = 'bi bi-exclamation-triangle-fill text-danger';
+                        });
                 });
             });
         };
@@ -3806,13 +4377,13 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
     </div>
 
     <div class="toast-container position-fixed top-0 end-0 p-4" style="z-index: 10500;">
-        <?php if (isset($status) && ($status === 'error' || $status === 'ok')): ?>
+        <?php if (isset($status) && in_array($status, ['error', 'ok', 'warning'])): ?>
             <div id="systemToast"
-                class="toast align-items-center text-white bg-<?php echo $status === 'ok' ? 'success' : 'danger'; ?> border-0"
+                class="toast align-items-center <?php echo $status === 'warning' ? 'text-dark bg-warning' : ($status === 'ok' ? 'text-white bg-success' : 'text-white bg-danger'); ?> border-0"
                 role="alert" aria-live="assertive" aria-atomic="true">
                 <div class="d-flex">
                     <div class="toast-body" style="font-family: 'Outfit', sans-serif; font-size: 1.05rem;">
-                        <?php echo $status === 'ok' ? '✅' : '⚠️'; ?>     <?php echo htmlspecialchars($message, ENT_QUOTES); ?>
+                        <?php echo $status === 'ok' ? '✅' : ($status === 'warning' ? '⚠️' : '❌'); ?>     <?php echo htmlspecialchars($message, ENT_QUOTES); ?>
                     </div>
                     <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"
                         aria-label="Cerrar"></button>
@@ -3875,8 +4446,8 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
         // AJAX Search Logic
         document.addEventListener('DOMContentLoaded', () => {
             const resultsContainer = document.querySelector('.results-inner');
-            const searchForm = document.querySelector('form[method="get"]:not(#per-page-form)');
-            const perPageForm = document.getElementById('per-page-form');
+            const searchForm = document.querySelector('form[method="get"]:not(#perPageForm)');
+            const perPageForm = document.getElementById('perPageForm');
             const loadingOverlay = document.getElementById('loading-overlay');
             const toastContainer = document.querySelector('.toast-container');
 
@@ -3987,13 +4558,34 @@ temas claros/oscuros (Dark Mode) y grillas responsivas.
 
             // Override Per-Page Form submission to prevent native form post
             if (perPageForm) {
-                perPageForm.submit = function () {
+                perPageForm.addEventListener('submit', function (e) {
+                    e.preventDefault();
                     const url = new URL(window.location.href);
                     const formData = new FormData(perPageForm);
                     url.search = new URLSearchParams(formData).toString() + '&ajax=1';
                     performAjaxSearch(url.toString());
-                };
+                });
             }
+
+            // Handle Per-Page dropdown options with Event Delegation
+            document.addEventListener('click', function (e) {
+                const btn = e.target.closest('.per-page-option');
+                if (btn) {
+                    e.preventDefault();
+                    const val = btn.getAttribute('data-value');
+                    document.getElementById('per_page_input').value = val;
+                    const label = document.querySelector('.per-page-label');
+                    if (label) label.textContent = val;
+
+                    const form = document.getElementById('perPageForm');
+                    if (form) {
+                        const url = new URL(window.location.href);
+                        const formData = new FormData(form);
+                        url.search = new URLSearchParams(formData).toString() + '&ajax=1';
+                        performAjaxSearch(url.toString());
+                    }
+                }
+            });
 
             // Intercept pagination and sorting links inside the results
             if (resultsContainer) {

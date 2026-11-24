@@ -1,6 +1,7 @@
 <?php
 // Llamada genérica a la API REST de Orthanc (método central para toda comunicación)
-function callOrthanc($method, $path, $body = null)
+// $timeout: segundos máximos de espera (default 30). Usar valores más bajos para C-FIND remoto.
+function callOrthanc($method, $path, $body = null, $timeout = 30)
 {
     global $ORTHANC_URL;
 
@@ -9,7 +10,8 @@ function callOrthanc($method, $path, $body = null)
 
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 30); // Timeout de 30 segundos para evitar hangs largos
+    curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, min(5, $timeout)); // Timeout de 30 segundos para evitar hangs largos
 
     $headers = ['Accept: application/json'];
 
@@ -131,7 +133,7 @@ function findStudiesInOrthancByPatientId(?string $patientId, int $maxTries = 1, 
     $body = [
         'Level' => 'Study',
         'Expand' => true,
-        'Query' => $query,
+        'Query' => (object)$query,
     ];
 
     for ($i = 0; $i < $maxTries; $i++) {
@@ -179,6 +181,22 @@ function orthancStudyExists(string $studyUid): bool
     return getOrthancStudyFullData($studyUid) !== null;
 }
 
+// Limpia queries DICOM antiguas en Orthanc
+function cleanupStaleOrthancQueries(int $maxKeep = 25): void
+{
+    try {
+        $queries = callOrthanc('GET', '/queries');
+        if (is_array($queries) && count($queries) > $maxKeep) {
+            $toDelete = array_slice($queries, 0, count($queries) - $maxKeep);
+            foreach ($toDelete as $qid) {
+                try {
+                    callOrthanc('DELETE', '/queries/' . urlencode($qid));
+                } catch (Exception $e) {}
+            }
+        }
+    } catch (Exception $e) {}
+}
+
 // Normaliza contenido simplificado de una respuesta de query a un set de MainDicomTags
 function normalizeQueryContent(array $c): array
 {
@@ -191,6 +209,10 @@ function normalizeQueryContent(array $c): array
         $sd = extractTagValue($c['StudyDate']);
     if ($sd === '' && isset($c['0008,0020']))
         $sd = extractTagValue($c['0008,0020']);
+        if ($sd === '' && isset($c['SeriesDate'])) $sd = extractTagValue($c['SeriesDate']);
+    if ($sd === '' && isset($c['0008,0021'])) $sd = extractTagValue($c['0008,0021']);
+    if ($sd === '' && isset($c['AcquisitionDate'])) $sd = extractTagValue($c['AcquisitionDate']);
+    if ($sd === '' && isset($c['0008,0022'])) $sd = extractTagValue($c['0008,0022']);
     $tags['StudyDate'] = $sd ?: null;
 
     // Patient / Nombre: buscar PatientName en varias formas
@@ -299,7 +321,7 @@ function normalizeString($str)
 }
 
 // Llamada genérica que devuelve el contenido bruto (para imágenes/previews)
-function callOrthancRaw($method, $path, $body = null)
+function callOrthancRaw($method, $path, $body = null, array $customHeaders = [])
 {
     global $ORTHANC_URL;
 
@@ -310,7 +332,7 @@ function callOrthancRaw($method, $path, $body = null)
     curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
     curl_setopt($ch, CURLOPT_TIMEOUT, 60);
 
-    $headers = [];
+    $headers = $customHeaders;
     if ($body !== null) {
         $payload = json_encode($body);
         curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
