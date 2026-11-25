@@ -766,7 +766,12 @@ if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 's
     }
 
     // Leer datos de sesión necesarios y liberar el lock inmediatamente
-    $lastQueryData = $_SESSION['last_query'] ?? null;
+    $lastQueryData = null;
+    if (isset($_SESSION['last_query']) && is_array($_SESSION['last_query'])) {
+        $lastQueryData = $_SESSION['last_query'];
+    } elseif (isset($_SESSION['last_query_data']) && is_array($_SESSION['last_query_data'])) {
+        $lastQueryData = $_SESSION['last_query_data'];
+    }
     $viewJobs = $_SESSION['view_jobs'] ?? [];
     session_write_close();
 
@@ -797,9 +802,9 @@ if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 's
         if ($queryId !== '' && $answerIdx !== '') {
             try {
                 $testAnswers = callOrthanc('GET', "/queries/" . urlencode($queryId) . "/answers");
-                if (is_array($testAnswers) && in_array($answerIdx, $testAnswers)) {
+                if (is_array($testAnswers) && in_array((string)$answerIdx, array_map('strval', $testAnswers), true)) {
                     $resolvedQueryId = $queryId;
-                    $resolvedAnswerIdx = $answerIdx;
+                    $resolvedAnswerIdx = (string)$answerIdx;
                 }
             } catch (Exception $e) {
                 $resolvedQueryId = null;
@@ -807,8 +812,10 @@ if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 's
         }
 
         // Si la query expiró o no la tenemos, recrearla
-        if (!$resolvedQueryId || !$resolvedAnswerIdx) {
-            $body = $lastQueryData['body'] ?? ['StudyInstanceUID' => $studyUid];
+        if (!$resolvedQueryId || $resolvedAnswerIdx === null || $resolvedAnswerIdx === '') {
+            $body = (!empty($lastQueryData['body']) && is_array($lastQueryData['body'])) 
+                ? $lastQueryData['body'] 
+                : ['StudyInstanceUID' => $studyUid];
             $newResp = callOrthanc('POST', "/modalities/$MODALITY_ID/query", [
                 'Level' => 'Study',
                 'Query' => $body
@@ -818,15 +825,20 @@ if (isset($_SESSION['user']) && isset($_GET['action']) && $_GET['action'] === 's
                 throw new Exception('No se pudo consultar ClearCanvas.');
             }
             $answers = callOrthanc('GET', "/queries/$resolvedQueryId/answers");
+            $resolvedAnswerIdx = null;
             foreach ($answers as $idx) {
                 $content = callOrthanc('GET', "/queries/$resolvedQueryId/answers/$idx/content?simplify");
                 $norm = normalizeQueryContent(is_array($content) ? $content : []);
                 if (($norm['StudyInstanceUID'] ?? '') === $studyUid) {
-                    $resolvedAnswerIdx = $idx;
+                    $resolvedAnswerIdx = (string)$idx;
                     break;
                 }
             }
-            if (!$resolvedAnswerIdx) {
+            // Si la consulta fue directa por StudyInstanceUID y devolvió resultados
+            if ($resolvedAnswerIdx === null && !empty($answers)) {
+                $resolvedAnswerIdx = (string)$answers[0];
+            }
+            if ($resolvedAnswerIdx === null || $resolvedAnswerIdx === '') {
                 throw new Exception('No se encontró el estudio en ClearCanvas.');
             }
         }
@@ -1133,9 +1145,9 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
     $_SESSION['active_queries'][] = time();
 
     // Limpiar búsquedas previas solo si los filtros cambiaron (evita recargar todo en la paginación)
-    if (!isset($_SESSION['last_query']) || $_SESSION['last_query'] !== $currentQueryHash) {
+    if (!isset($_SESSION['last_search_hash']) || $_SESSION['last_search_hash'] !== $currentQueryHash) {
         unset($_SESSION['last_search_results']);
-        $_SESSION['last_query'] = $currentQueryHash;
+        $_SESSION['last_search_hash'] = $currentQueryHash;
     }
 
     // --- [OPTIMIZACIÓN] session_write_close() para concurrencia multi-tab / multi-usuario ---
@@ -1143,7 +1155,7 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
     // Esto libera el lock del archivo de sesión, permitiendo que otras peticiones
     // del mismo usuario (otras pestañas) no queden bloqueadas esperando.
     $cachedSearchResults = $_SESSION['last_search_results'] ?? null;
-    $cachedLastQuery = $_SESSION['last_query_data'] ?? null;
+    $cachedLastQuery = $_SESSION['last_query'] ?? ($_SESSION['last_query_data'] ?? null);
     $sessionUser = $_SESSION['user'] ?? null;
     $sessionActiveQueries = $_SESSION['active_queries'] ?? [];
     session_write_close(); // <-- Libera el lock de sesión
@@ -1511,7 +1523,8 @@ if (isset($_SESSION['user']) && $_SERVER['REQUEST_METHOD'] === 'GET' && isset($_
                                     // Reabrir sesión para escritura (fue cerrada antes de las llamadas de red)
                                     session_start();
                                     $_SESSION['last_search_results'] = $display;
-                                    $_SESSION['last_query_data'] = ['id' => $queryId, 'when' => time(), 'body' => $query];
+                                    $_SESSION['last_query'] = ['id' => $queryId, 'when' => time(), 'body' => $query];
+                                    $_SESSION['last_query_data'] = $_SESSION['last_query'];
                                     session_write_close();
 
                                     $studies = $display;
@@ -1711,8 +1724,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
                             $norm = normalizeQueryContent(is_array($content) ? $content : []);
                             $remoteUidNorm = $norm['StudyInstanceUID'] ?? null;
                             if ($remoteUidNorm === $studyUid) {
-                                $queryId = $queryId ?: $tryQ;
-                                $answerIdx = $answerIdx ?: $idx;
+                                $queryId = $queryId !== '' ? $queryId : $tryQ;
+                                $answerIdx = $answerIdx !== '' ? $answerIdx : (string)$idx;
                                 break;
                             }
                         }
@@ -1930,8 +1943,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_SESSION[
                         $norm = normalizeQueryContent(is_array($content) ? $content : []);
                         $remoteUidNorm = $norm['StudyInstanceUID'] ?? null;
                         if ($remoteUidNorm === $studyUid) {
-                            $queryId = $queryId ?: $tryQ;
-                            $answerIdx = $answerIdx ?: $idx;
+                            $queryId = $queryId !== '' ? $queryId : $tryQ;
+                            $answerIdx = $answerIdx !== '' ? $answerIdx : (string)$idx;
                             break;
                         }
                     }
@@ -2242,8 +2255,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_download' && isset($_SE
                         $norm = normalizeQueryContent(is_array($content) ? $content : []);
                         $remoteUidNorm = $norm['StudyInstanceUID'] ?? null;
                         if ($remoteUidNorm === $studyUid) {
-                            $foundQ = $foundQ ?: $tryQ;
-                            $foundA = $foundA ?: $idx;
+                            $foundQ = $foundQ !== '' ? $foundQ : $tryQ;
+                            $foundA = $foundA !== '' ? $foundA : (string)$idx;
                             break;
                         }
                     }
